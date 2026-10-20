@@ -86,6 +86,55 @@ def test_a_cte_name_is_not_mistaken_for_an_unmatched_relation():
     assert prepared.notes == []
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        (
+            "with t as ("
+            "    select 1 as id, 10 as amount "
+            "    union all select 2, 200"
+            ") "
+            "select id, amount from t where amount > 5"
+        ),
+        (
+            "with t as ("
+            "    select 1 as id, 10 as amount "
+            "    union select 2, 200"
+            ") "
+            "select id, amount from t where amount > 5"
+        ),
+        (
+            "with outer_cte as ("
+            "    with inner_cte as (select 1 as id) "
+            "    select id from inner_cte"
+            ") "
+            "select id from outer_cte"
+        ),
+    ],
+)
+def test_a_cte_with_set_operation_or_nested_is_not_mistaken_for_unmatched_relation(
+    sql,
+):
+    prepared = _prepare(sql)
+    assert not any(
+        "matches none of this model's declared parents" in note
+        for note in prepared.notes
+    )
+
+
+def test_unmatched_relation_still_reported_alongside_set_operation_cte():
+    sql = (
+        "with t as ("
+        "    select 1 as id "
+        "    union all select 2"
+        ") "
+        'select t.id, o.a from t cross join "dev"."main"."not_a_parent" o'
+    )
+    prepared = _prepare(sql)
+    assert any("not_a_parent" in note for note in prepared.notes)
+    assert not any("t matches none" in note for note in prepared.notes)
+
+
 def test_an_inlined_ephemeral_parent_is_stripped_and_restored():
     """dbt hoists an ephemeral parent into the model's own SQL as a CTE. Left
     there, the mutant would carry a copy of the parent that no fixture can

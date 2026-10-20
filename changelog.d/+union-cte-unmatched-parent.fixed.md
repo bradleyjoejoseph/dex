@@ -1,0 +1,1 @@
+**`transform test --mutate` recognizes set-operation and nested CTEs.** A model whose CTE body is a UNION or contains nested CTEs is no longer spuriously warned about matching none of the model's declared parents.

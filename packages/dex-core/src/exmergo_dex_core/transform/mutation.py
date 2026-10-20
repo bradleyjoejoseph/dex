@@ -1011,7 +1011,9 @@ def _relation_text(table: exp.Table, dialect: str) -> str:
 def _names_a_scope(table: exp.Table, tree: exp.Expression) -> bool:
     """True when this table reference is really a CTE name defined in the tree."""
 
-    return table.name.lower() in {name.lower() for name in sql_shape.scopes(tree)}
+    return table.name.lower() in {
+        cte.alias.lower() for cte in tree.find_all(exp.CTE) if cte.alias
+    }
 
 
 def _owning_clause(node: exp.Expression) -> tuple[exp.Select | None, str]:
