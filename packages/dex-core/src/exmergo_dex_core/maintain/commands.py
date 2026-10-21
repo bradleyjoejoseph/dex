@@ -1083,7 +1083,7 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
                     ),
                 )
                 row_findings, row_warnings, row_reason, offer = _row_population(
-                    engine, adapter, project_dir, live, handshake=row_ask
+                    engine, adapter, project_dir, live, scope=wanted, handshake=row_ask
                 )
                 findings.extend(row_findings)
                 warnings.extend(row_warnings)
@@ -1230,7 +1230,15 @@ def _join_contract(
     return findings, plan_notes + finding_notes, None, offer
 
 
-def _row_population(engine: DexEngine, adapter, project_dir, live, *, handshake=None):
+def _row_population(
+    engine: DexEngine,
+    adapter,
+    project_dir,
+    live,
+    *,
+    scope: set[str] | None = None,
+    handshake=None,
+):
     """The row-loss and fanout half of `maintain verify`, end to end.
 
     Split out because it is the only part of the command with a cost decision
@@ -1250,7 +1258,9 @@ def _row_population(engine: DexEngine, adapter, project_dir, live, *, handshake=
     except DialectDependencyError as exc:
         return [], [], str(exc), None
 
-    checks, plan_notes = verify_mod.row_population_plan(project_dir, adapter.dialect)
+    checks, plan_notes = verify_mod.row_population_plan(
+        project_dir, adapter.dialect, scope=scope
+    )
     if not checks:
         # The plan's own first note is the reason where it has one (no compiled
         # manifest, every model skipped): it is more specific than anything this

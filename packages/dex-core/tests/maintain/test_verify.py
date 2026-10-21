@@ -2857,3 +2857,81 @@ def test_an_unfollowable_version_is_named_once_per_version(tmp_path: Path):
     _checks, notes = verify_mod.row_population_plan(tmp_path, "duckdb")
     assert len(notes) == 1
     assert "dim_orders.v1 (" in notes[0] and "dim_orders.v2 (" in notes[0]
+
+
+def test_uncompiled_models_are_named_in_notes_and_suppression_reason(tmp_path: Path):
+    """#733: models without compiled SQL are named in notes with a dbt compile hint,
+    while ephemeral models (no relation) are skipped quietly."""
+
+    nodes = {
+        "m.1": {
+            "name": "stg_orders",
+            "resource_type": "model",
+            "relation_name": '"wh"."main"."stg_orders"',
+        },
+        "m.2": {
+            "name": "stg_payments",
+            "resource_type": "model",
+            "relation_name": '"wh"."main"."stg_payments"',
+            "compiled_code": "",
+        },
+        "m.3": {
+            "name": "ephemeral_helper",
+            "resource_type": "model",
+            "relation_name": None,
+            "config": {"materialized": "ephemeral"},
+        },
+    }
+    checks, notes = _plan(tmp_path, nodes)
+    assert checks == []
+    assert len(notes) == 1
+    assert "no compiled SQL found for stg_orders, stg_payments" in notes[0]
+    assert "run `dbt compile` or `dbt build`" in notes[0]
+    assert "ephemeral_helper" not in notes[0]
+
+
+def test_uncompiled_models_in_scoped_plan_only_reports_in_scope(tmp_path: Path):
+    """A scoped call only reports uncompiled models that are within scope."""
+
+    nodes = {
+        "m.1": {
+            "name": "stg_orders",
+            "resource_type": "model",
+            "relation_name": '"wh"."main"."stg_orders"',
+        },
+        "m.2": {
+            "name": "stg_payments",
+            "resource_type": "model",
+            "relation_name": '"wh"."main"."stg_payments"',
+        },
+    }
+    _plan(tmp_path, nodes)
+    checks, notes = verify_mod.row_population_plan(tmp_path, "duckdb", scope={"m.1"})
+    assert checks == []
+    assert len(notes) == 1
+    assert "stg_orders" in notes[0]
+    assert "stg_payments" not in notes[0]
+
+
+def test_verify_suppression_names_uncompiled_models_end_to_end(
+    maintain_repo, _assume_the_project_compiles
+):
+    """#733 end-to-end: maintain verify sets the suppression reason to the
+    uncompiled note and warning rather than the generic fallback."""
+
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.stg_returns": {
+                "name": "stg_returns",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."stg_returns"',
+            }
+        },
+        results=[],
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    suppressed = payload["data"]["suppressed"]["row_population"]
+    assert "no compiled SQL found for stg_returns" in suppressed
+    assert "run `dbt compile` or `dbt build`" in suppressed

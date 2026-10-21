@@ -1,0 +1,1 @@
+**`maintain verify` names uncompiled models when row population is suppressed.** When models have no compiled SQL, the suppression reason and warnings name the skipped models with a `dbt compile` or `dbt build` hint rather than falling back to an uninformative generic message. Ephemeral models remain quietly skipped.
