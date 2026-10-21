@@ -1,0 +1,1 @@
+**`transform place` follows trailing `select * from <cte>` models into their CTE column list.** A scaffolded model ending in `select * from renamed` is no longer treated as projecting an untracked star, allowing it to serve as the lowest common ancestor and threading derivations directly into its CTE column list.
