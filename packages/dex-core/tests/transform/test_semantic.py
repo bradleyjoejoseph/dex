@@ -5,7 +5,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+import yaml
+
 from exmergo_dex_core.cli import main
+from exmergo_dex_core.transform.semantic import validate_semantic_yaml
+from exmergo_dex_core.transform.validate import EditValidationError
 
 _VALID_SEMANTIC_YAML = """\
 semantic_models:
@@ -105,6 +110,7 @@ def test_semantic_define_creates_a_plan_not_a_file(
     assert envelope["status"] == "ok"
     assert envelope["diffs"] and envelope["diffs"][0]["op"] == "create"
     assert "transform apply" in envelope["data"]["next"]
+    assert not any("structural check only" in w for w in envelope.get("warnings", []))
     assert not (dbt_project_dir / "models/semantic/customers.yml").exists()
 
 
@@ -127,6 +133,7 @@ def test_semantic_define_rejects_invalid_metricflow_yaml(
     )
     assert rc == 1
     assert envelope["status"] == "error"
+    assert any("'nope' is not one of" in err for err in envelope["errors"])
 
 
 def test_semantic_define_requires_semantic_content(
@@ -1513,3 +1520,91 @@ def test_definition_edit_removes_from_an_indentless_sequence(
         "remove.json",
     )
     assert landed == _INDENTLESS_YAML
+
+
+def test_validate_semantic_yaml_uses_metricflow_semantic_interfaces(monkeypatch):
+    """When metricflow_semantic_interfaces is available, it validates the schema."""
+    imported = []
+    orig_import = __import__
+
+    def tracked_import(name, *args, **kwargs):
+        if name.startswith("metricflow_semantic_interfaces"):
+            imported.append("metricflow")
+        return orig_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", tracked_import)
+
+    parsed = yaml.safe_load(_VALID_SEMANTIC_YAML)
+    warnings = validate_semantic_yaml("models/semantic/customers.yml", parsed)
+    assert warnings == []
+    assert "metricflow" in imported
+
+    no_model = yaml.safe_load(
+        "semantic_models:\n"
+        "  - name: customers\n"
+        "    entities:\n"
+        "      - name: customer\n"
+        "        type: primary\n"
+        "        expr: id\n"
+    )
+    with pytest.raises(EditValidationError, match="needs a model: ref"):
+        validate_semantic_yaml("models/semantic/customers.yml", no_model)
+
+    bad_metric = yaml.safe_load(
+        "metrics:\n  - name: revenue\n    type: nope\n    type_params: {}\n"
+    )
+    with pytest.raises(EditValidationError, match="'nope' is not one of"):
+        validate_semantic_yaml("models/semantic/customers.yml", bad_metric)
+
+
+def test_validate_semantic_yaml_falls_back_to_dbt_semantic_interfaces(monkeypatch):
+    """When metricflow_semantic_interfaces is absent, fall back to dbt schemas."""
+    orig_import = __import__
+
+    def missing_metricflow_import(name, *args, **kwargs):
+        if name.startswith("metricflow_semantic_interfaces"):
+            raise ImportError(f"No module named '{name}'")
+        return orig_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", missing_metricflow_import)
+
+    parsed = yaml.safe_load(_VALID_SEMANTIC_YAML)
+    warnings = validate_semantic_yaml("models/semantic/customers.yml", parsed)
+    assert warnings == []
+
+    bad_metric = yaml.safe_load(
+        "metrics:\n  - name: revenue\n    type: nope\n    type_params: {}\n"
+    )
+    with pytest.raises(EditValidationError, match="'nope' is not one of"):
+        validate_semantic_yaml("models/semantic/customers.yml", bad_metric)
+
+
+def test_validate_semantic_yaml_falls_back_to_structural_check(monkeypatch):
+    """When neither interface package is installed, structural check warns cleanly."""
+    orig_import = __import__
+
+    def missing_both_import(name, *args, **kwargs):
+        if name.startswith(
+            ("metricflow_semantic_interfaces", "dbt_semantic_interfaces")
+        ):
+            raise ImportError(f"No module named '{name}'")
+        return orig_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", missing_both_import)
+
+    parsed = yaml.safe_load(_VALID_SEMANTIC_YAML)
+    warnings = validate_semantic_yaml("models/semantic/customers.yml", parsed)
+    assert warnings == [
+        "metricflow_semantic_interfaces is not installed (install the "
+        "[semantic] extra); semantic YAML got a structural check only"
+    ]
+
+    no_model = yaml.safe_load("semantic_models:\n  - name: customers\n")
+    with pytest.raises(EditValidationError, match="needs at least name and model"):
+        validate_semantic_yaml("models/semantic/customers.yml", no_model)
+
+    bad_metric = yaml.safe_load("metrics:\n  - name: revenue\n    type: simple\n")
+    with pytest.raises(
+        EditValidationError, match="needs at least name, type, and type_params"
+    ):
+        validate_semantic_yaml("models/semantic/customers.yml", bad_metric)

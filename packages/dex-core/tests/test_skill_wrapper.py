@@ -71,8 +71,10 @@ def test_the_wrapper_knows_every_engine_connector(wrapper):
         (["transform", "plan", "add a model"], []),
         (["maintain", "schema"], []),
         (["maintain", "reconcile"], []),
-        # dbt semantic authoring reads no Ossie document.
-        (["semantic", "define", "--edits-file", "edits.json"], []),
+        # dbt semantic authoring takes MetricFlow schema validation (#639).
+        (["semantic", "define", "--edits-file", "edits.json"], ["semantic"]),
+        (["semantic", "update", "--edits-file", "edits.json"], ["semantic"]),
+        (["semantic", "plan", "--edits-file", "edits.json"], ["semantic"]),
         # scikit-learn, and only where clustering actually runs.
         (["explore", "cluster", "orders"], ["cluster"]),
         # jsonschema for every command that can read a native Ossie layer (#536):
@@ -163,6 +165,10 @@ def test_the_extras_are_the_connector_plus_whatever_the_command_needs(
     assert wrapper._extras(["--connector", "snowflake", "explore", "cluster", "o"]) == [
         "snowflake",
         "cluster",
+    ]
+    assert wrapper._extras(["semantic", "define", "--edits-file", "edits.json"]) == [
+        "duckdb",
+        "semantic",
     ]
 
 

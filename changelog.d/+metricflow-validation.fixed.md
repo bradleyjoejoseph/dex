@@ -1,0 +1,1 @@
+**`semantic define|update|plan` now run MetricFlow schema validation.** The skills' wrappers now install the `[semantic]` extra for semantic authoring commands, and schema validation imports from `metricflow_semantic_interfaces` with fallback to `dbt_semantic_interfaces`. When neither package is available, the warning directs users to the missing package and extra.

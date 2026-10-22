@@ -251,6 +251,15 @@ _VALUE_FLAGS = (
 # either backend and therefore never needs the renderer.
 _SEMANTIC_RENDERING_MODES = ("values", "query")
 
+# The dbt semantic layer authoring commands (#639). Each validates definitions
+# against MetricFlow's schemas before writing a plan, and therefore needs the
+# `semantic` extra (which ships MetricFlow).
+_SEMANTIC_AUTHORING_COMMANDS = (
+    ("semantic", "define"),
+    ("semantic", "update"),
+    ("semantic", "plan"),
+)
+
 # The commands that can read a native Ossie semantic layer, as (group,
 # subcommand). The `ossie` extra is `jsonschema` and nothing heavier, so it is
 # taken whenever the layer *might* be read rather than resolved from
@@ -339,6 +348,8 @@ def _feature_extras(argv: list[str], vendor: str | None = None) -> list[str]:
     )
     if command in _SLAYER_COMMANDS or (vendor == _SLAYER_VENDOR and reads_layer):
         extras.append("slayer")
+    if command in _SEMANTIC_AUTHORING_COMMANDS:
+        extras.append("semantic")
     if command != ("explore", "semantic"):
         return extras
     mode = positionals[2] if len(positionals) > 2 else "list"
