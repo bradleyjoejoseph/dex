@@ -430,6 +430,51 @@ def test_build_failure_names_the_cause_behind_a_whole_run_fatal(
     )
 
 
+def test_build_failure_surfaces_validation_error_details(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Pydantic validation errors include the field and rule that failed on
+    the lines following the header; keeping only the generic header left the
+    cause hidden (issue #727)."""
+
+    real_error = (
+        "Encountered an error:\n"
+        "1 validation error for PydanticSemanticModel\n"
+        "node_relation -> relation_name\n"
+        "  none is not an allowed value (type=type_error.none.not_allowed)"
+    )
+    lines = [
+        json.dumps(
+            {
+                "info": {
+                    "level": "error",
+                    "name": "MainEncounteredError",
+                    "msg": real_error,
+                }
+            }
+        ),
+    ]
+    _fake_runner_factory(monkeypatch, returncode=2, stdout="\n".join(lines))
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert envelope["errors"][0] == (
+        "dbt build failed: Encountered an error: 1 validation error for "
+        "PydanticSemanticModel: node_relation -> relation_name: "
+        "none is not an allowed value (type=type_error.none.not_allowed)"
+    )
+
+
 def test_build_failure_message_strips_ansi_color_codes(
     dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
 ):

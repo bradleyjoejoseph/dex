@@ -440,6 +440,53 @@ def test_run_hooks_are_stripped_from_the_copy_and_said_so(
     assert "on-run-start" in manifest_path.read_text()
 
 
+def test_shadow_run_strip_semantic_models(project):
+    from exmergo_dex_core.transform.build import ShadowRun
+
+    sem_yaml = project / "models" / "semantic.yml"
+    sem_yaml.write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: fct\n"
+        "semantic_models:\n"
+        "  - name: fct_sem\n"
+        "    model: ref('fct')\n"
+        "metrics:\n"
+        "  - name: m1\n",
+        encoding="utf-8",
+    )
+    with ShadowRun(project, target="dev") as shadow:
+        assert shadow.strip_semantic_models("other_model") is False
+        assert shadow.strip_semantic_models("fct") is True
+        assert shadow.strip_semantic_models("fct") is False
+        shadow_sem = shadow._require_shadow() / "models" / "semantic.yml"
+        assert shadow_sem.is_file()
+        content = shadow_sem.read_text(encoding="utf-8")
+        assert "models:" in content
+        assert "semantic_models:" not in content
+        assert "metrics:" not in content
+    assert "semantic_models:" in sem_yaml.read_text(encoding="utf-8")
+
+
+def test_mutation_coverage_warns_when_semantic_models_stripped(
+    project, recorded_dbt, monkeypatch
+):
+    _calls, plan = recorded_dbt
+    plan["manifest"] = _manifest()
+    plan["results"] = _results()
+    sem_path = project / "models" / "semantic.yml"
+    sem_path.write_text(
+        "version: 2\nsemantic_models:\n  - name: fct_sem\n    model: ref('fct')\n",
+        encoding="utf-8",
+    )
+    _skip_dev_target_check(monkeypatch)
+    result = transform_commands.test_mutations(_engine(project), "fct")
+    assert any(
+        "semantic models referencing 'fct' were omitted" in w for w in result.warnings
+    )
+    assert "semantic_models:" in sem_path.read_text()
+
+
 # --- equivalence on the dev data, faked --------------------------------------
 
 
@@ -1051,6 +1098,57 @@ def test_every_kind_of_test_gets_to_answer_for_the_mutant(measurable_project: Pa
     assert "not_null_fct_id" in names
     assert "no_null_region" in names
     assert "fct_pins_its_rules" in names
+
+
+def test_mutation_testing_on_model_referenced_by_semantic_model(
+    measurable_project: Path,
+):
+    """Regression for #727: transform test --mutate fails on any model a
+    semantic model refs because an ephemeral mutant has no relation name.
+    The referencing semantic model must be dropped from the shadow copy so
+    dbt can compile and run data tests on the mutant."""
+
+    pytest.importorskip("dbt.adapters.duckdb")
+    (measurable_project / "models" / "metricflow_time_spine.sql").write_text(
+        "select date '2020-01-01' + cast(i as integer) as date_day "
+        "from range(365) t(i)",
+        encoding="utf-8",
+    )
+    (measurable_project / "models" / "semantic.yml").write_text(
+        "version: 2\n"
+        "semantic_models:\n"
+        "  - name: metricflow_time_spine\n"
+        "    model: ref('metricflow_time_spine')\n"
+        "    primary_entity: date_day\n"
+        "    dimensions:\n"
+        "      - name: date_day\n"
+        "        type: time\n"
+        "        type_params:\n"
+        "          time_granularity: day\n"
+        "  - name: fct_sem\n"
+        "    model: ref('fct')\n"
+        "    entities:\n"
+        "      - name: id\n"
+        "        type: primary\n"
+        "    dimensions:\n"
+        "      - name: region\n"
+        "        type: categorical\n",
+        encoding="utf-8",
+    )
+    (measurable_project / "models" / "schema.yml").write_text(
+        _schema_yml(False), encoding="utf-8"
+    )
+    engine = _engine(measurable_project)
+    engine.build(target="dev")
+
+    result = engine.test_mutations("fct")
+    assert result.counts["generated"] >= 4
+    assert any(
+        "semantic models referencing 'fct' were omitted" in w for w in result.warnings
+    )
+    semantic_file = measurable_project / "models" / "semantic.yml"
+    assert semantic_file.is_file()
+    assert "fct_sem" in semantic_file.read_text(encoding="utf-8")
 
 
 def test_a_mutation_run_writes_nothing_and_materializes_nothing(
