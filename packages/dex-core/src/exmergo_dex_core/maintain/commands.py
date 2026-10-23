@@ -37,6 +37,7 @@ from .. import command_args
 from .. import envelope as env
 from ..adapters.base import name_list
 from ..config import pii_override_paths
+from ..engine_version import state_version_warning
 from ..errors import (
     DexError,
     PrerequisiteError,
@@ -946,6 +947,7 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
     definitions = project.definitions()
     suppressed: dict[str, str] = {}
     findings: list = []
+    notes: list[str] = []
     warnings = list(definitions.notes)
     project_dir: Path | None = None
     artifact_reason: str | None = None
@@ -1082,10 +1084,18 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
                         scope=wanted,
                     ),
                 )
-                row_findings, row_warnings, row_reason, offer = _row_population(
-                    engine, adapter, project_dir, live, scope=wanted, handshake=row_ask
+                row_findings, row_warnings, row_notes, row_reason, offer = (
+                    _row_population(
+                        engine,
+                        adapter,
+                        project_dir,
+                        live,
+                        scope=wanted,
+                        handshake=row_ask,
+                    )
                 )
                 findings.extend(row_findings)
+                notes.extend(row_notes)
                 warnings.extend(row_warnings)
                 if row_reason is not None:
                     suppressed["row_population"] = row_reason
@@ -1112,6 +1122,7 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
     result = VerifyResult(
         findings=drift_mod.rank_findings(findings),
         suppressed=suppressed,
+        notes=notes,
         warnings=warnings,
     )
     if cost is not None:
@@ -1130,9 +1141,7 @@ def _column_contract(project_dir, adapter, model_relations, live, *, scope=None)
     No cost decision in it at all, unlike row population beside it: both
     sides are metadata (the compiled manifest's own declared columns, and
     ``adapter.table_metadata``'s schema lookup), so there is nothing to
-    price and nothing to offer. Returns ``(findings, notes, suppressed_
-    reason)``, the same shape :func:`_row_population` returns minus the
-    offer it has no use for.
+    price and nothing to offer. Returns ``(findings, notes, suppressed_reason)``.
 
     ``scope`` is the same lowered object-name set `verify()` filters its
     findings down to afterward. Passed through here too so a scoped call
@@ -1244,7 +1253,7 @@ def _row_population(
     Split out because it is the only part of the command with a cost decision
     in it, and because its inert cases are its own: an install with no dialect
     engine, a project never compiled, a model whose driving parent cannot be
-    identified. Returns ``(findings, warnings, suppressed_reason, offer)``.
+    identified. Returns ``(findings, warnings, notes, suppressed_reason, offer)``.
 
     ``handshake`` is passed straight through to :func:`~..maintain.verify.
     relation_counts`; the default (``None``) is that function's own
@@ -1256,11 +1265,12 @@ def _row_population(
     try:
         dialect_guard.ensure_available()
     except DialectDependencyError as exc:
-        return [], [], str(exc), None
+        return [], [], [], str(exc), None
 
-    checks, plan_notes = verify_mod.row_population_plan(
+    checks, plan_notes, informational = verify_mod.row_population_plan(
         project_dir, adapter.dialect, scope=scope
     )
+    warning_notes = [note for note in plan_notes if note not in informational]
     if not checks:
         # The plan's own first note is the reason where it has one (no compiled
         # manifest, every model skipped): it is more specific than anything this
@@ -1270,7 +1280,7 @@ def _row_population(
             if plan_notes
             else "no compiled model could be lined up against a driving parent"
         )
-        return [], plan_notes, reason, None
+        return [], warning_notes, informational, reason, None
 
     wanted = sorted({relation for check in checks for relation in check.relations})
     measured = verify_mod.relation_counts(
@@ -1287,8 +1297,8 @@ def _row_population(
         measured.absent,
         measured.deferred,
     )
-    notes = plan_notes + measured.notes + finding_notes
-    return findings, notes, None, measured.offer
+    warnings = warning_notes + measured.notes + finding_notes
+    return findings, warnings, informational, None, measured.offer
 
 
 def cmd_verify(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
@@ -2164,4 +2174,17 @@ def _baseline_warnings(
     warnings.extend(
         _cache_age_warnings(snap, freshness_hours, datetime.now(UTC)),
     )
+    # A baseline pinned by another release was measured by that release's
+    # profiler and fingerprinted by its project reader, so some of what this run
+    # reports as drift may be the engine changing rather than the warehouse
+    # (#731). Not a refusal: the baseline still parses, and the operator decides
+    # whether the current state is the one to re-pin.
+    version_warning = state_version_warning(
+        "the drift baseline",
+        snap.tool_version,
+        "drift reported against it may reflect the engine change as well as the "
+        "warehouse; re-run `maintain snapshot` once the current state is known-good",
+    )
+    if version_warning:
+        warnings.append(version_warning)
     return warnings

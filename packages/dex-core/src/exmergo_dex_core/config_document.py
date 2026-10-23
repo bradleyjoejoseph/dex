@@ -37,7 +37,7 @@ from .diffs import file_diff
 from .envelope import redact, secret_like
 from .errors import ConfigurationError, RequestError
 from .storage import DEX_DIR
-from .values_free import CALLER_ONLY_KEYS, CALLER_ONLY_MESSAGE
+from .values_free import caller_only_message
 from .yaml_spans import before_trailing_blanks, block_end, indent_of
 
 CONFIG_RELPATH = f"{DEX_DIR}/{CONFIG_FILE}"
@@ -664,14 +664,14 @@ class ConfigDocument:
         fields = model.model_fields
         for name, sub in value.items():
             path = f"{prefix}{name}"
-            if not prefix and name in CALLER_ONLY_KEYS:
+            if (message := caller_only_message(path)) is not None:
                 # Not a typo of something else, so no suggestion: a setting this
-                # file cannot hold, named as such (#591).
+                # file cannot hold, named as such (#591, #787).
                 found.append(
                     ConfigProblem(
                         "caller_only_key",
                         path,
-                        CALLER_ONLY_MESSAGE,
+                        message,
                         line=self._line_of(path),
                     )
                 )

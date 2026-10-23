@@ -257,6 +257,15 @@ the 10 MB per-query minimum applies to each. A comparison the dry run refuses
 turns the check off with a reason, before anything is spent. Without the flag,
 survivors report `equivalence.status: not_checked`.
 
+With `--downstream`, the tests of the models that read the mutated one run
+against each mutant too, routed through those models as ephemeral, so nothing
+is materialized there either. It is opt-in here because each downstream test
+recomputes the chain beneath it, and it is priced into the same single estimate:
+each mutant's line grows by the downstream tests it will run.
+Each downstream test is dry-run priced with the mutant spliced in beneath the
+models it reads, so the estimate is exact, and the 10 MB per-query minimum
+applies to each.
+
 
 
 With `--layered-schemas`, the scaffolded `generate_schema_name` override makes

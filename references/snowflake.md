@@ -177,6 +177,16 @@ priced as if every mutant survives. Only survivors run one, so the settled
 seconds are at most that line, ledgered under the same command. Without the
 flag, survivors report `equivalence.status: not_checked`.
 
+With `--downstream`, the tests of the models that read the mutated one run
+against each mutant too, routed through those models as ephemeral, so nothing
+is materialized there either. It is opt-in here because each downstream test
+recomputes the chain beneath it, and it is priced into the same single estimate:
+each mutant's line grows by the downstream tests it will run.
+The heuristic prices a statement by the bytes it scans, and a downstream test
+recomputes the whole chain beneath it (joins and aggregates included), so on a
+large source it can settle above its line; the stop rule counts settled
+seconds, so the confirmed budget still binds.
+
 
 `--verify` also reads the dev schema (`snowflake.dev_database` /
 `snowflake.dev_schema`) for the length of that one command, because dbt writes

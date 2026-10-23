@@ -12,7 +12,13 @@ from pathlib import Path
 import pytest
 import yaml
 
-from .conftest import assert_ok, assert_unpivot_build, unpivot_fixture_edits
+from .conftest import (
+    assert_downstream_run,
+    assert_ok,
+    assert_unpivot_build,
+    downstream_probe_edits,
+    unpivot_fixture_edits,
+)
 from .test_postgres_connect import run_cli, seed_repo
 
 pytestmark = [pytest.mark.integration, pytest.mark.postgres]
@@ -279,3 +285,68 @@ def test_mutation_equivalence_labels_survivors_live(
     labels = {m["operator"]: m["equivalence"] for m in data["mutants"]}
     assert labels["comparison"]["status"] == "equivalent"
     assert labels["case_branch"]["status"] == "distinguishable"
+
+
+def test_mutation_downstream_tests_catch_what_the_models_own_miss_live(
+    tmp_path: Path, capsys, dev_dsn, pg_dev_password
+):
+    """transform test --mutate --downstream (#648) on Postgres: opt-in, priced
+    into the one estimate, and the mart's count test catches the dropped
+    filter the intermediate model's own tests miss. The dev schema holds the
+    same relations afterwards: the mart is routed through as ephemeral."""
+
+    import psycopg
+
+    seed_repo(tmp_path, budget=300)
+    root = str(tmp_path)
+    rc, envelope = run_cli(
+        [
+            "--repo-root",
+            root,
+            "transform",
+            "init",
+            "analytics",
+            "--connector",
+            "postgres",
+        ],
+        capsys,
+    )
+    assert_ok(rc, envelope)
+    edits_file = tmp_path / "edits.json"
+    edits_file.write_text(
+        json.dumps(
+            downstream_probe_edits(
+                "select * from (values (1, 10), (2, 200), (3, 1)) as v(id, amount)"
+            )
+        ),
+        encoding="utf-8",
+    )
+    rc, planned = run_cli(
+        [
+            "--repo-root",
+            root,
+            "transform",
+            "plan",
+            "downstream mutation probe",
+            "--edits-file",
+            str(edits_file),
+        ],
+        capsys,
+    )
+    assert rc == 0, planned
+    rc, applied = run_cli(["--repo-root", root, "transform", "apply"], capsys)
+    assert rc == 0, applied
+
+    def relations() -> set:
+        with psycopg.connect(dev_dsn, password=pg_dev_password) as conn:
+            return {
+                row[0]
+                for row in conn.execute(
+                    "select table_name from information_schema.tables "
+                    "where table_schema = 'dbt_dev'"
+                ).fetchall()
+            }
+
+    before = relations()
+    assert_downstream_run(run_cli, capsys, root, 300)
+    assert relations() == before

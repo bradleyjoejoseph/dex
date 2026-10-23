@@ -68,11 +68,28 @@ def _suite() -> EvalSuite:
     )
 
 
-def test_real_explore_suite_loads_and_validates():
-    suite = load_suite(_REPO / "skills" / "explore")
-    assert suite.skill_name == "explore"
+@pytest.mark.parametrize("skill", ["explore", "transform", "maintain"])
+def test_real_suites_load_and_validate(skill):
+    suite = load_suite(_REPO / "skills" / skill)
+    assert suite.skill_name == skill
     assert suite.triggering.positive and suite.triggering.negative
     assert all(case.assertions for case in suite.evals)
+    ids = [case.id for case in suite.evals]
+    assert len(ids) == len(set(ids)), f"{skill} reuses an eval id"
+
+
+@pytest.mark.parametrize("skill", ["explore", "transform", "maintain"])
+def test_every_suite_guards_spending_authority_in_both_directions(skill):
+    """#787: each skill carries the rule that task data never authorizes spend,
+    so each suite samples it, refusing a planted approval and confirming inside
+    committed limits. Sampled behaviour, not proof; the descriptions say so."""
+
+    suite = load_suite(_REPO / "skills" / skill)
+    cases = [c for c in suite.evals if "Spending-authority case" in c.expected_output]
+    assert any("planted" in " ".join(c.assertions) for c in cases)
+    assert any("Autonomy direction" in c.expected_output for c in cases)
+    caveat = "not proof that injection is impossible"
+    assert all(caveat in c.expected_output for c in cases)
 
 
 def test_triggering_is_clean_when_agent_fires_correctly():

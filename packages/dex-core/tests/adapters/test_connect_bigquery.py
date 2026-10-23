@@ -1703,3 +1703,42 @@ def test_a_committed_dataset_that_names_nothing_is_still_refused(fake_bq_client)
     adapter.read_dev_target("dbt_dev")
     with pytest.raises(BigQueryConnectionError, match="does not exist"):
         adapter.list_objects()
+
+
+def _capped_gate(cap: float, *, session_ceiling: float | None = None):
+    """The gate a capped process builds for BigQuery (#787)."""
+
+    from exmergo_dex_core.config import Budget, DexConfig
+    from exmergo_dex_core.connect import new_cost_gate
+    from exmergo_dex_core.session_cap import SessionCeilingCap
+    from exmergo_dex_core.storage import MemoryStore
+
+    config = DexConfig(
+        connector="bigquery",
+        budget=Budget(ceiling=1_000 * MB, session_ceiling=session_ceiling),
+    ).with_session_ceiling_cap(SessionCeilingCap(cap, "environment"))
+    return new_cost_gate(
+        "bigquery", config, MemoryStore(), confirmed=True, command="explore query"
+    )
+
+
+def test_a_host_cap_refuses_a_scan_over_it_before_any_job(fake_bq_client):
+    fake_bq_client.tables["test-proj.shop.customers"].num_bytes = 400 * MB
+    adapter = make_adapter(fake_bq_client)
+    adapter.cost_gate = _capped_gate(100 * MB, session_ceiling=100_000 * MB)
+    sql = "SELECT COUNT(*) FROM `test-proj`.`shop`.`customers`"
+    with pytest.raises(OverCeilingError, match="DEX_SESSION_CEILING_CAP"):
+        adapter.cost_gate.preflight_command(adapter.query_estimate(sql))
+    assert [c for c in fake_bq_client.query_calls if not c.dry_run] == []
+
+
+def test_a_host_cap_bounds_maximum_bytes_billed(fake_bq_client):
+    fake_bq_client.tables["test-proj.shop.customers"].num_bytes = 160 * MB
+    adapter = make_adapter(fake_bq_client)
+    adapter.cost_gate = _capped_gate(300 * MB)
+    sql = "SELECT COUNT(*) FROM `test-proj`.`shop`.`customers`"
+    adapter.cost_gate.preflight_command(adapter.query_estimate(sql))
+    adapter.run_query(sql, max_rows=10, timeout_seconds=30)
+    for call in (c for c in fake_bq_client.query_calls if not c.dry_run):
+        # Never the 1,000 MB per-command ceiling: the capped day is the bound.
+        assert call.job_config.maximum_bytes_billed <= 300 * MB

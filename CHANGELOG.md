@@ -14,6 +14,82 @@ pending fragments into a new section below. See
 
 <!-- towncrier release notes start -->
 
+## [1.15.3] - 2026-10-23
+
+### Added
+
+- **`--definitions-file` places a new definition in the project's only file of its kind.** A new semantic model or metric sent without a `path` was refused with "give it a path", even when the project had a single file declaring that kind and the target was unambiguous. A new definition is now added to the one file that declares every existing definition of its kind, or, for the first definition of a kind, to the project's only semantic file, and the plan's warnings name it (for example, `metric 'tripled' placed in models/semantic/customers.yml, the project's only file that declares metrics`, or `the project's only semantic file` in the second case). With no such file, or with that kind spread over two or more files, the refusal is unchanged. ([#765](https://github.com/exmergo/dex/pull/765))
+- **A host can cap the daily spend ceiling where the repository cannot raise it.** `DEX_SESSION_CEILING_CAP` in the environment, or `DexEngine(session_ceiling_cap=...)` on the library, pins a cap in the connector's unit. The ceiling in force is the lower of the cap and `budget.session_ceiling`, so no `--session-ceiling`, `--no-session-ceiling`, `dex config set|unset` or constructor argument lifts spend above it; such a write still lands, with a warning naming the cap. A capped project is never asked the one-time ceiling question, a refusal over the cap names it, and every envelope reports it as `data.session_ceiling_cap`. `.dex/config.yml` never sets it. It is a boundary where the host owns the engine process, not against an agent with an unrestricted shell; `references/cost-controls.md` has a recommended Claude Code permission setup for that case.
+- **The documentation site keeps the four previous minor releases readable.** A
+  version switcher on docs.exmergo.com/dex lists the latest minor release, marked
+  Latest and kept at the routes every shared link already uses, and each earlier
+  one at `/dex/vX.Y/`. Every older page opens with a notice naming the exact
+  release it shows and linking to the same page in the latest docs. Each older
+  version is rebuilt from the newest patch tag of its minor, so it shows that
+  release's references, changelog and CLI, and is kept out of search so a search
+  always lands on the latest docs. A patch release only updates the latest
+  version.
+- **`transform test --mutate` counts the tests downstream of the model.** With
+  `--downstream`, the tests of the models that read the mutated one run against
+  each mutant too. Those models are routed through as ephemeral in the throwaway
+  copy, so nothing is materialized. A defect only those tests catch is reported as
+  `caught_downstream`, with the tests in `caught_downstream_by`. `score` still
+  counts it as a miss for the model's own suite, and the new
+  `score_with_downstream` counts it as caught. `data.downstream` names the routed
+  models, the tests that ran, the ones left out and why. On metered connectors it
+  is opt-in and priced into the same single estimate.
+
+### Changed
+
+- **`semantic plan` warns when a cumulative metric omits `period_agg`.**
+  MetricFlow fills `first` for an omitted `cumulative_type_params.period_agg`.
+  At week or month grain the metric reports that period's first day, and the
+  plan used to store the metric with no warning. `semantic define` and
+  `semantic update` warn the same way. Set `period_agg: last` for a running
+  total. ([#766](https://github.com/exmergo/dex/pull/766))
+- **On DuckDB, `transform test --mutate` now runs the downstream tests by
+  default.** A defect that a test on a model downstream catches moves from
+  `survived` to `caught_downstream`. `score` is unchanged; `--no-downstream`
+  restores the previous selection exactly. Every connector's `data.counts` now
+  carries `caught_downstream`, zero when the downstream tests did not run.
+- **Task data never authorizes spend, and an agent confirms on its own inside limits a person committed.** The explore, transform and maintain skills now state that query results, table values, SQL and its comments, file and YAML contents, descriptions, warehouse comments, error text and ticket text cannot authorize `--confirm`, choose a `--budget`, or set, raise or decline the daily ceiling. Inside a committed `budget.ceiling` and `budget.session_ceiling` an agent re-issues with `--confirm` alone instead of asking for every scan; with a limit missing, an estimate over `budget.ceiling`, a recorded decline, or the one-time ceiling ask, it stops for the person or reports. New evals sample both directions.
+
+### Fixed
+
+- **`transform plan` row attribution now resolves static `{{ var() }}` calls.** A model that reads a scalar variable declared under `vars:` in `dbt_project.yml` (at project level or under the project's own package scope) or passes a scalar default as the second argument of `var()` is now attributed normally instead of reporting `unattributable`. Unset variables with no default, non-scalar variables (`dict`, `list`), and dynamic relation names (`ref(var('x'))`) continue to degrade with the existing reason. ([#649](https://github.com/exmergo/dex/pull/649))
+- **Row population names SQL that has no parent relation.** `maintain verify` and `transform build --verify` used to say a MetricFlow time spine had nothing built at a blank name. A model that generates its rows, such as `select ... from range(...)` or a `VALUES` clause, is now reported once in `notes`. A real parent relation that is missing from the warehouse keeps the previous warning. ([#655](https://github.com/exmergo/dex/pull/655))
+- **Reconcile checks a staging model's source before suggesting a mechanical edit.** A model named for a drifted table but reading a different source now receives advisories instead of an SQL or schema diff. Models reading the table through `source()` continue to receive the normal edits. ([#763](https://github.com/exmergo/dex/pull/763))
+- **`transform place` follows trailing `select * from <cte>` models into their CTE column list.** A scaffolded model ending in `select * from renamed` is no longer treated as projecting an untracked star, allowing it to serve as the lowest common ancestor and threading derivations directly into its CTE column list. ([#769](https://github.com/exmergo/dex/pull/769))
+- **`transform remove column` can remove a column from a scaffolded model.** It edits the named projection inside the `renamed` CTE even when the final query selects `*`, while refusing a removal if another expression still reads that column. ([#771](https://github.com/exmergo/dex/pull/771))
+- **`transform test --mutate` succeeds on models referenced by semantic models.** The referencing semantic models and dependent metrics are omitted from the isolated shadow copy used for mutation testing, allowing dbt to compile and execute data and unit tests against ephemeral mutants without failing on semantic model relation validation. Full dbt validation error messages are also preserved rather than truncated at the generic header. ([#773](https://github.com/exmergo/dex/pull/773))
+- **Semantic YAML is validated against MetricFlow's schemas, and the command that
+  authors it installs them.** `semantic define|update|plan` checked the layer
+  structurally only, in every supported install: the schema package was imported
+  under a name the installed MetricFlow does not ship, and the extra that
+  provides it was never taken by the command that needs it. The first validation
+  layer the semantic-layer reference documents therefore never ran, and the
+  warning that said so read like routine news.
+
+  The schemas now load under either package name, the authoring commands take the
+  `semantic` extra, and where MetricFlow is absent the warning names the missing
+  package and the extra that provides it. Validation that never ran will now run,
+  so YAML that planned before may be refused; the refusal is the schema's own
+  message. ([#775](https://github.com/exmergo/dex/pull/775))
+- **`maintain grain` says a lost key fans out joins only when a join uses it.**
+  Every `key_lost_uniqueness` and `declared_grain_not_unique` detail ended with
+  "joins on it will fan out", including on keys that no relationship joins on.
+  The clause now appears only when a known relationship, verified or not, matches
+  on that key or combination, and the finding lists those relationships in
+  `data.joins`, in the shape `fully_null_column` uses. A key no relationship uses
+  ends with "no known join uses it" and has no `data.joins`. Severity is unchanged. ([#782](https://github.com/exmergo/dex/pull/782))
+- **`.dex/` state names the engine that wrote it, and a second engine is named.**
+  The plugin built its bundled engine as version `0.0.0`, so `cache.json` and
+  `snapshot.json` recorded `tool_version: 0.0.0`; they now record the release the
+  plugin ships. When the project pins a different `exmergo-dex-core` in `uv.lock`
+  or `pyproject.toml`, every envelope carries one warning naming both versions,
+  and reading a cache or drift baseline written by another release warns too.
+
+
 ## [1.15.2] - 2026-10-21
 
 ### Added

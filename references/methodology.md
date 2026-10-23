@@ -285,6 +285,16 @@ survivors are defects the current data cannot distinguish at all, such as an
 inner join where every key happens to match, which is exactly why the finding
 names the test that would catch it rather than claiming the model is wrong.
 
+A defect has to get past every test in the project to ship, not only the tests on
+the model it was planted in. A mart test that pins every published count is often
+the strongest test an intermediate model has, and a measurement that ignored it
+would push the same coverage one hop upstream for no gain. So the tests on the
+models downstream run too, with the mutant routed through them, and a defect only
+they caught is reported apart from one the model's own tests caught: the first
+says the project would have stopped it, the second says this model's suite would
+have. The per-model score keeps the second meaning, because it is the one a
+reader acts on when deciding where a test belongs.
+
 dex measures which survivors those are. Each one is compared with the unmutated
 model on the dev target, and the two kinds need different tests: a survivor the
 data cannot tell apart needs a fixture that reaches the case, since no assertion

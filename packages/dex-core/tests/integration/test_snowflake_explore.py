@@ -124,6 +124,43 @@ def test_over_ceiling_refusal_is_live_and_free(
     assert not (tmp_path / ".dex" / "spend.jsonl").exists()
 
 
+def test_a_host_cap_binds_over_a_generous_budget_live(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    sf_scratch_database,
+    sf_warehouse,
+    sf_connection_name,
+):
+    """#787: a declined cumulative ceiling and a generous --budget still meet
+    the host's cap, refused at the estimate stage with nothing spent."""
+
+    seed_repo(
+        tmp_path,
+        sf_scratch_database,
+        sf_warehouse,
+        sf_connection_name,
+        databases=[HUGE_SCOPE],
+    )
+    monkeypatch.setenv("DEX_SESSION_CEILING_CAP", "2")
+    rc, envelope = run_cli(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "explore",
+            "profile",
+            "LINEITEM",
+            "--confirm",
+            "--budget",
+            "600",
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert "DEX_SESSION_CEILING_CAP=2" in envelope["errors"][0]
+    assert envelope["data"]["session_ceiling_cap"]["unit"] == "seconds"
+
+
 def test_firewalled_query_round_trip(
     tmp_path: Path, capsys, sf_scratch_database, sf_warehouse, sf_connection_name
 ):

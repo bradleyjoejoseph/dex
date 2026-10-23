@@ -752,6 +752,21 @@ def _walk_node_entry(entry: Any, found: list[YamlName]) -> None:
                 span=_span(fields["name"]),
             )
         )
+    # dbt 1.9 YAML snapshots name their parent through ``relation:``. Mirror
+    # references._record_snapshot_relation so rename rewrites the call the same
+    # way it rewrites a relationship test's ``to:``.
+    if "relation" in fields:
+        relation_node = fields["relation"]
+        target = _relation_target(_scalar_value(relation_node))
+        if target is not None:
+            found.append(
+                YamlName(
+                    name=target,
+                    form="yaml_snapshot_relation",
+                    kind="source" if "." in target else "model",
+                    span=_relation_span(relation_node),
+                )
+            )
     _walk_columns(fields, found, owner)
     for key in ("tests", "data_tests"):
         for test in _sequence(fields.get(key)):

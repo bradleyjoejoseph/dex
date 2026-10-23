@@ -326,6 +326,12 @@ are not yet compared with the model on the dev data on this connector, so each
 reports `equivalence.status: not_checked` with the reason, and nothing is
 priced or run for it.
 
+With `--downstream`, the tests of the models that read the mutated one run
+against each mutant too, routed through those models as ephemeral, so nothing
+is materialized there either. It is opt-in here because each downstream test
+recomputes the chain beneath it, and it is priced into the same single estimate:
+each mutant's line grows by the downstream tests it will run.
+
 
 `--verify` also reads `clickhouse.dev_database` for the length of that one
 command, because dbt writes the relations it is judging there and that database

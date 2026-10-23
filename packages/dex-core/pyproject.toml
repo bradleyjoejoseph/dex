@@ -277,16 +277,20 @@ packages = ["src/exmergo_dex_core"]
 
 # The version is the git tag (v0.1.0 -> 0.1.0): one source of truth, never a
 # hand-edited literal that can drift from the tag the release pipeline cuts.
-# fallback_version keeps source builds that cannot reach .git (for example a
-# build in an isolated temp dir) from failing; CI guards against an accidental
-# fallback by asserting the built version equals the tag before publishing.
+# fallback_version is the version a source build reports when it cannot reach
+# .git, and the installed plugin is exactly that build: the skill wrappers build
+# the bundled packages/dex-core from a plugin cache that carries no .git. So it is
+# not a placeholder but the release this tree ships, rewritten by
+# scripts/prepare_release.sh beside DEX_CORE_VERSION (the release workflow
+# checks both) so that `.dex/` provenance names a real engine rather than 0.0.0
+# (#731). CI separately asserts the built wheel's version equals the tag.
 [tool.hatch.version]
 source = "vcs"
 
 [tool.hatch.version.raw-options]
 # This package lives in a subdirectory; the repository .git is two levels up.
 root = "../.."
-fallback_version = "0.0.0"
+fallback_version = "1.15.3"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

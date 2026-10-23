@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ import pytest
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.transform.row_attribution import (
     MAX_CHANGES_PER_MODEL,
+    UnattributableError,
     naming_resolver,
     render_model_sql,
 )
@@ -452,6 +454,167 @@ def test_a_free_connector_measures_without_being_asked(
 )
 def test_rendering_reduces_a_model_to_comparable_sql(model_sql, expected):
     assert render_model_sql(model_sql, naming_resolver) == expected
+
+
+@pytest.mark.parametrize(
+    ("model_sql", "vars_map", "expected"),
+    [
+        (
+            "select * from {{ ref('stg_orders') }} where status = {{ var('status') }}",
+            {"status": "SHIPPED"},
+            "select * from stg_orders where status = 'SHIPPED'",
+        ),
+        (
+            "select cast('{{ var(\"essay_date\") }}' as date) as dt",
+            {"essay_date": "2026-09-12"},
+            "select cast('2026-09-12' as date) as dt",
+        ),
+        (
+            "select * from {{ ref('stg_orders') }} "
+            "where days <= {{ var('lookback_days', 30) }}",
+            {},
+            "select * from stg_orders where days <= 30",
+        ),
+        (
+            "select {{ var('x', 'fallback') }}",
+            {},
+            "select 'fallback'",
+        ),
+        (
+            "select {{ var('x', default='fallback') }}",
+            {},
+            "select 'fallback'",
+        ),
+        (
+            "select * from {{ ref('stg_orders') }} "
+            "where is_cancelled = {{ var('flag', false) }}",
+            {"flag": True},
+            "select * from stg_orders where is_cancelled = TRUE",
+        ),
+        (
+            "select * from {{ ref('stg_orders') }} "
+            "where ratio >= {{ var('min_ratio', 0.25) }}",
+            {},
+            "select * from stg_orders where ratio >= 0.25",
+        ),
+    ],
+)
+def test_rendering_resolves_static_var_calls_and_defaults(
+    model_sql, vars_map, expected
+):
+    assert render_model_sql(model_sql, naming_resolver, vars_map) == expected
+
+
+@pytest.mark.parametrize(
+    ("model_sql", "vars_map", "expected_reason"),
+    [
+        (
+            "select {{ var('undefined') }}",
+            {},
+            "the model calls {{ var('undefined') }}, which only dbt can render",
+        ),
+        (
+            "select {{ var('mapping_var') }}",
+            {"mapping_var": {"nested": 1}},
+            "the model calls {{ var('mapping_var') }}, which only dbt can render",
+        ),
+        (
+            "select {{ var('list_var') }}",
+            {"list_var": ["a", "b"]},
+            "the model calls {{ var('list_var') }}, which only dbt can render",
+        ),
+        (
+            "select * from {{ ref(var('dynamic_model')) }}",
+            {"dynamic_model": "stg_orders"},
+            "could not read a relation name out of {{ ref(var('dynamic_model')) }}",
+        ),
+        (
+            "select * from {{ source(var('dynamic_src'), 'orders') }}",
+            {"dynamic_src": "raw"},
+            "could not read a relation name out of "
+            "{{ source(var('dynamic_src'), 'orders') }}",
+        ),
+    ],
+)
+def test_rendering_refuses_unresolvable_or_non_scalar_var_calls(
+    model_sql, vars_map, expected_reason
+):
+    with pytest.raises(UnattributableError, match=re.escape(expected_reason)):
+        render_model_sql(model_sql, naming_resolver, vars_map)
+
+
+def test_a_model_reading_static_project_vars_is_attributed(
+    attributable_project, plan_edit, capsys
+):
+    repo, warehouse = attributable_project
+    (repo / "analytics" / "dbt_project.yml").write_text(
+        'name: shop\nversion: "1.0.0"\nprofile: shop\nmodel-paths: ["models"]\n'
+        "vars:\n  excluded_status: 'CANCELLED'\n  shop:\n    min_revenue: 0\n",
+        encoding="utf-8",
+    )
+    prior_with_vars = PRIOR_MODEL.replace(
+        "where status != 'CANCELLED' and total_revenue > 0",
+        "where status != '{{ var(\"excluded_status\") }}' "
+        "and total_revenue > {{ var('min_revenue', 10) }}",
+    )
+    (repo / "analytics" / MODEL_PATH).write_text(prior_with_vars, encoding="utf-8")
+    payload = plan_edit(
+        prior_with_vars.replace(
+            "status != '{{ var(\"excluded_status\") }}'",
+            "not is_cancelled",
+        )
+    )
+
+    model = _attribution(_plan(repo, warehouse, payload, capsys))
+    swap = _by_kind(model, "predicate_replaced")
+    assert len(swap) == 1, model["changes"]
+    assert swap[0]["prior"] == "status <> 'CANCELLED'"
+    assert swap[0]["authored"] == "NOT is_cancelled"
+    assert swap[0]["attributed"] is True
+    assert swap[0]["delta"] != 0
+
+
+def test_a_model_reading_var_with_literal_default_is_attributed(
+    attributable_project, plan_edit, capsys
+):
+    repo, warehouse = attributable_project
+    prior_with_default = PRIOR_MODEL.replace(
+        "where status != 'CANCELLED' and total_revenue > 0",
+        "where status != {{ var('excluded_status', 'CANCELLED') }} "
+        "and total_revenue > 0",
+    )
+    (repo / "analytics" / MODEL_PATH).write_text(prior_with_default, encoding="utf-8")
+    payload = plan_edit(
+        prior_with_default.replace(
+            "status != {{ var('excluded_status', 'CANCELLED') }}",
+            "not is_cancelled",
+        )
+    )
+
+    model = _attribution(_plan(repo, warehouse, payload, capsys))
+    swap = _by_kind(model, "predicate_replaced")
+    assert len(swap) == 1, model["changes"]
+    assert swap[0]["attributed"] is True
+    assert swap[0]["delta"] != 0
+
+
+def test_an_undefined_or_non_scalar_var_degrades_with_existing_reason(
+    attributable_project, plan_edit, capsys
+):
+    repo, warehouse = attributable_project
+    (repo / "analytics" / "dbt_project.yml").write_text(
+        'name: shop\nversion: "1.0.0"\nprofile: shop\nmodel-paths: ["models"]\n'
+        "vars:\n  status_list:\n    - CANCELLED\n    - C\n",
+        encoding="utf-8",
+    )
+    for expr in ("{{ var('undefined') }}", "{{ var('status_list') }}"):
+        payload = plan_edit(
+            PRIOR_MODEL.replace("status != 'CANCELLED'", f"status != {expr}")
+        )
+        model = _attribution(_plan(repo, warehouse, payload, capsys))
+        assert all(c["attributed"] is False for c in model["changes"])
+        reasons = " ".join(c["reason"] or "" for c in model["changes"])
+        assert "only dbt can render" in reasons
 
 
 # --- the metered half ------------------------------------------------------------

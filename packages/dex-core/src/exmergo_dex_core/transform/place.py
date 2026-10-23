@@ -242,7 +242,7 @@ def _projected(
     if path is None or not path.endswith(".sql"):
         return None
     try:
-        return output_columns(view.files[path].content, path)
+        return output_columns(view.files[path].content, path, through_ctes=True)
     except RewriteError:
         return None
 
@@ -313,7 +313,11 @@ def _thread(
         source = expression if node == ancestor else column
         try:
             result = project_column_in_sql(
-                view.files[path].content, path, source, column
+                view.files[path].content,
+                path,
+                source,
+                column,
+                through_ctes=True,
             )
         except RewriteError as exc:
             raise PlacementRefusedError(str(exc)) from exc
@@ -455,7 +459,11 @@ def _per_target(
             continue
         try:
             result = project_column_in_sql(
-                view.files[path].content, path, expression, column
+                view.files[path].content,
+                path,
+                expression,
+                column,
+                through_ctes=True,
             )
         except RewriteError as exc:
             raise PlacementRefusedError(str(exc)) from exc

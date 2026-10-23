@@ -24,6 +24,7 @@ import argparse
 import contextlib
 import os
 import sys
+from pathlib import Path
 from typing import Any
 
 from . import command_args
@@ -34,6 +35,11 @@ from .guards.cost_guard import ConfirmationRequiredError, CostGuardError
 from .guards.dialect import DialectDependencyError
 from .guards.dialect import ensure_available as ensure_dialect_available
 from .results import BudgetExhaustedError
+from .session_cap import (
+    SESSION_CEILING_CAP_ENV,
+    SessionCeilingCap,
+    parse_session_ceiling_cap,
+)
 from .values_free import (
     ResultMode,
     call_withholding,
@@ -187,7 +193,10 @@ _CONNECTION_OPTION_HELP: dict[str, str] = {
     "--repo-root": "directory to resolve .dex/config.yml from, walking up (default: .)",
     "--confirm": "run a billed command after its cost was quoted",
     "--budget": "spend this command may use, in the connector's cost unit",
-    "--session-ceiling": "answer the one-time ask: commit this daily spend ceiling",
+    "--session-ceiling": (
+        "answer the one-time ask: commit a daily ceiling "
+        f"({SESSION_CEILING_CAP_ENV} caps)"
+    ),
     "--no-session-ceiling": "answer the one-time ask: record that no ceiling applies",
     "--values-free": f"return no table value in any result ({RESULT_MODE_ENV} pins it)",
 }
@@ -380,8 +389,9 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
     ("transform", "test"): (
         "scaffold a unit test, or mutation-test existing tests",
         "--scaffold plans a unit_tests skeleton for a model. --mutate plants "
-        "one defect at a time and reports which ones no test caught. Mutation "
-        "runs dbt on the dev target and is billed on metered connectors.",
+        "one defect at a time and reports which ones no test caught; "
+        "--downstream also counts the tests of the models that read it. "
+        "Mutation runs dbt on the dev target and is billed on metered connectors.",
     ),
     ("transform", "export"): (
         "export a stored plan as a portable, digested document",
@@ -1243,6 +1253,23 @@ def _build_parser() -> argparse.ArgumentParser:
                         action="store_false",
                         help="report survivors without comparing them",
                     )
+                    # Tri-state for the same reason: routing each mutant
+                    # through the models that read it recomputes the chain in
+                    # every one of their tests, which is free only on DuckDB.
+                    reach = sp.add_mutually_exclusive_group()
+                    reach.add_argument(
+                        "--downstream",
+                        dest="downstream",
+                        action="store_true",
+                        default=None,
+                        help="also run the tests of the models downstream of it",
+                    )
+                    reach.add_argument(
+                        "--no-downstream",
+                        dest="downstream",
+                        action="store_false",
+                        help="run only the model's own tests",
+                    )
                 if group == "semantic" and name in {"define", "update", "plan"}:
                     sp.add_argument(
                         "argument",
@@ -1629,6 +1656,10 @@ def main(argv: list[str] | None = None) -> int:
     # Resolved before anything can refuse, so even a refusal states the mode. An
     # unknown DEX_RESULT_MODE is itself a refusal, rendered below like any other.
     result_mode: ResultMode | None = None
+    # The host's cap on the daily ceiling (#787), resolved alongside the mode for
+    # the same reason: a refusal should still say it, and a malformed one is
+    # itself a refusal.
+    session_cap: SessionCeilingCap | None = None
     # Building the engine is inside the handler, not before it: it reads the
     # config file and constructs the configured storage backend, and both can
     # refuse. Every agent wrapper expects exactly one envelope on stdout, so a
@@ -1636,6 +1667,9 @@ def main(argv: list[str] | None = None) -> int:
     # traceback the wrapper cannot parse.
     try:
         result_mode = _result_mode(args)
+        session_cap = parse_session_ceiling_cap(
+            os.environ.get(SESSION_CEILING_CAP_ENV), source="environment"
+        )
         if args.group == "config":
             # No engine, on purpose: see `config_commands`. With none, nothing
             # below has a paradigm, a spend, or a connection to stamp, which is
@@ -1664,6 +1698,7 @@ def main(argv: list[str] | None = None) -> int:
                 session_ceiling=getattr(args, "session_ceiling", None),
                 decline_session_ceiling=getattr(args, "no_session_ceiling", False),
                 result_mode=result_mode,
+                session_ceiling_cap=session_cap,
             )
             try:
                 envelope = dispatch(args, engine)
@@ -1711,7 +1746,9 @@ def main(argv: list[str] | None = None) -> int:
     # collect; an engine that never got this far (construction itself refused)
     # has nothing to carry.
     if engine is not None and engine.connection_warnings:
-        envelope.warnings = list(engine.connection_warnings) + list(envelope.warnings)
+        envelope.warnings = [
+            w for w in engine.connection_warnings if w not in envelope.warnings
+        ] + list(envelope.warnings)
 
     # What the config file says that no command refuses (a key the schema does
     # not know, a key written twice) rides out on every envelope the same way,
@@ -1720,12 +1757,31 @@ def main(argv: list[str] | None = None) -> int:
     if engine is not None and engine.config is not None:
         envelope.warnings = list(engine.config.load_warnings) + list(envelope.warnings)
 
+    # A project that pins its own dex-core beside the one running here shares
+    # `.dex/` with it, and nothing else would say so (#731). Read from the
+    # project's own files with no connection, so it rides every envelope, the
+    # config verbs included; best-effort, since a pin dex cannot read is not a
+    # reason to lose the command's answer.
+    with contextlib.suppress(Exception):
+        from .engine_version import pin_warning
+
+        pin = pin_warning(Path(repo_root(args)))
+        if pin is not None:
+            envelope.warnings = [pin, *envelope.warnings]
+
     # A config amendment dex performed on the caller's behalf (the answer to the
     # cumulative-ceiling ask, issue #283) rides out the same way, as a diff:
     # the write happened before the command did, so even a command that failed
     # afterwards has to report it or the file changed with nothing saying so.
     if engine is not None and engine.config_diffs:
-        envelope.diffs = list(engine.config_diffs) + list(envelope.diffs)
+        envelope.diffs = [
+            d for d in engine.config_diffs if d not in envelope.diffs
+        ] + list(envelope.diffs)
+    # And what a host's cap made of that amendment (#787): written, but moot.
+    if engine is not None and engine.budget_warnings:
+        envelope.warnings = [
+            w for w in engine.budget_warnings if w not in envelope.warnings
+        ] + list(envelope.warnings)
 
     # Every command runs against a connector or against none, so every envelope
     # can name the paradigm a later billed command would spend in. Filled only
@@ -1744,6 +1800,10 @@ def main(argv: list[str] | None = None) -> int:
     # included, so a host can assert the mode on whatever comes back (#591).
     if result_mode is ResultMode.VALUES_FREE:
         envelope.data["result_mode"] = result_mode.value
+    # And every envelope a capped process prints names the cap (#787), for the
+    # same reason: a host asserts the bound on whatever comes back.
+    if session_cap is not None:
+        envelope.data["session_ceiling_cap"] = session_cap.payload(envelope.cost.unit)
 
     env.emit(envelope)
     return 0 if envelope.status != env.Status.ERROR else 1

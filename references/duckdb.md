@@ -129,6 +129,13 @@ and unasked here: one aggregate `dbt show` per survivor, plus one self-check of
 the unmutated model against itself, labels it `equivalent` or
 `distinguishable`. `--no-check-equivalence` turns that off.
 
+The tests of the models downstream of the mutated one run against each mutant
+too, unasked here because it is free: each downstream model is made ephemeral in
+the same copy, so dbt inlines the chain, mutant at the bottom, into each of its
+tests. A defect only those tests caught is `caught_downstream`, and `score`
+still counts it as a miss for the model's own suite. `--no-downstream` turns
+that off.
+
 
 
 The dev target being the source file is also why `transform init`'s content

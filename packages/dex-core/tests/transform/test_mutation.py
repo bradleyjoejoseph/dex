@@ -715,3 +715,121 @@ def test_splicing_unparseable_test_sql_returns_nothing():
         "not sql )(", model_name="fct_orders", body="select 1", dialect="duckdb"
     )
     assert out is None
+
+
+# --- downstream tests (#648) ---------------------------------------------------
+
+
+def test_a_catch_only_downstream_is_kept_apart_from_a_kill():
+    """The defect could not ship, but the model's own suite missed it, and the
+    per-model score has to keep saying so."""
+
+    baseline = {"own": "pass", "mart": "pass"}
+    verdict = mutation.classify(
+        baseline, {"own": "pass", "mart": "fail"}, downstream={"mart"}
+    )
+    assert verdict.outcome == "caught_downstream"
+    assert verdict.caught_by == []
+    assert verdict.caught_downstream == ["mart"]
+
+
+def test_a_kill_by_the_models_own_test_still_names_the_downstream_catch():
+    verdict = mutation.classify(
+        {"own": "pass", "mart": "pass"},
+        {"own": "fail", "mart": "fail"},
+        downstream={"mart"},
+    )
+    assert verdict.outcome == "killed"
+    assert verdict.caught_by == ["own"]
+    assert verdict.caught_downstream == ["mart"]
+
+
+def test_a_downstream_warning_is_a_warn_only_catch():
+    verdict = mutation.classify(
+        {"own": "pass", "mart": "pass"},
+        {"own": "pass", "mart": "warn"},
+        downstream={"mart"},
+    )
+    assert verdict.outcome == "caught_downstream"
+    assert verdict.warn_only is True
+
+
+def test_a_downstream_error_with_no_catch_is_rejected_not_survived():
+    """A mutant a downstream model cannot even run on would fail the build."""
+
+    verdict = mutation.classify(
+        {"own": "pass", "mart": "pass"},
+        {"own": "pass", "mart": "error"},
+        downstream={"mart"},
+    )
+    assert verdict.outcome == "rejected"
+
+
+def test_without_downstream_tests_classify_is_what_it_was():
+    verdict = mutation.classify({"a": "pass", "b": "pass"}, {"a": "pass", "b": "fail"})
+    assert verdict.outcome == "killed"
+    assert verdict.caught_downstream == []
+
+
+def _graph(nodes: dict[str, dict], edges: dict[str, list[str]]) -> dict:
+    full = {
+        uid: {
+            "name": uid.split(".")[-1],
+            "resource_type": uid.split(".")[0],
+            "package_name": "p",
+            "language": "sql",
+            "config": {"materialized": "table"},
+            **extra,
+        }
+        for uid, extra in nodes.items()
+    }
+    return {"metadata": {"project_name": "p"}, "nodes": full, "child_map": edges}
+
+
+def test_the_closure_walks_nearest_first_and_visits_a_diamond_once():
+    manifest = _graph(
+        {"model.p.int": {}, "model.p.b": {}, "model.p.a": {}, "model.p.mart": {}},
+        {
+            "model.p.int": ["model.p.b", "model.p.a", "test.p.t1"],
+            "model.p.a": ["model.p.mart"],
+            "model.p.b": ["model.p.mart"],
+        },
+    )
+    closure = mutation.downstream_closure(manifest, "model.p.int")
+    assert closure.eligible == ["model.p.a", "model.p.b", "model.p.mart"]
+    assert closure.cut == [] and closure.elided == 0
+
+
+@pytest.mark.parametrize(
+    "uid,extra,reason",
+    [
+        ("snapshot.p.snap", {}, "snapshot"),
+        ("model.p.py", {"language": "python"}, "Python model"),
+        ("model.p.pkg", {"package_name": "other"}, "installed package"),
+        ("model.p.hdr", {"config": {"sql_header": "set x = 1"}}, "sql_header"),
+    ],
+)
+def test_a_node_that_cannot_carry_the_mutant_cuts_its_whole_branch(uid, extra, reason):
+    """Below it, every model reads its relation in the warehouse, which holds
+    the unmutated rows, so walking on would route nothing."""
+
+    manifest = _graph(
+        {"model.p.int": {}, uid: extra, "model.p.below": {}},
+        {"model.p.int": [uid], uid: ["model.p.below"]},
+    )
+    closure = mutation.downstream_closure(manifest, "model.p.int")
+    assert closure.eligible == []
+    assert [entry["unique_id"] for entry in closure.cut] == [uid]
+    assert reason in closure.cut[0]["reason"]
+
+
+def test_the_cap_keeps_the_nearest_models_and_counts_the_rest():
+    manifest = _graph(
+        {"model.p.int": {}, "model.p.a": {}, "model.p.b": {}, "model.p.deep": {}},
+        {"model.p.int": ["model.p.a", "model.p.b"], "model.p.a": ["model.p.deep"]},
+    )
+    closure = mutation.downstream_closure(manifest, "model.p.int", cap=2)
+    assert closure.eligible == ["model.p.a", "model.p.b"]
+    assert closure.elided == 1
+    assert closure.cut[0]["name"] == "deep"
+    assert "cap of 2" in closure.cut[0]["reason"]

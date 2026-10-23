@@ -982,6 +982,7 @@ def test_mutations(
     max_mutants: int | None = None,
     target: str | None = None,
     check_equivalence: bool | None = None,
+    downstream: bool | None = None,
 ) -> MutationCoverageResult:
     """Plant standard analytics defects in a model and report which tests miss them.
 
@@ -1003,6 +1004,10 @@ def test_mutations(
     spend everywhere else, so ``None`` checks only where it bills nothing,
     ``True`` checks and prices the comparisons into the same batch, and
     ``False`` never checks.
+
+    ``downstream`` is tri-state the same way and for the same reason. Routing
+    each mutant through the models that read it, so their tests answer for it
+    too, is free on DuckDB and recomputes the chain on every test elsewhere.
     """
 
     from ..adapters import get_dialect
@@ -1065,7 +1070,33 @@ def test_mutations(
                     "mutation coverage invokes dbt once per mutant, and a hook "
                     "that grants or audits would otherwise fire once per run"
                 )
+            if shadow.strip_semantic_models(model):
+                warnings.append(
+                    f"semantic models referencing '{model}' were omitted from the "
+                    "shadow project: mutation coverage runs with an ephemeral mutant, "
+                    "which the semantic layer cannot anchor"
+                )
             node, model_path = _mutable_model(engine, shadow, model, mutation_mod)
+            below = _DownstreamTests.prepare(
+                shadow,
+                node,
+                model=model,
+                requested=downstream,
+                paradigm=paradigm,
+                connector=connector,
+                mutation_mod=mutation_mod,
+            )
+            if not below.direct and not below.tests:
+                # Free, and the more useful answer than "nothing to mutate":
+                # with no test to catch anything, every mutant survives by
+                # construction and the run would spend N dbt invocations to say
+                # so.
+                raise mutation_mod.MutationError(
+                    f"'{model}' has no tests, so there is nothing to measure: every "
+                    "planted defect would survive by construction. Write one first "
+                    f"(`transform test --scaffold {model}` scaffolds a unit test), "
+                    "then measure it" + below.no_tests_hint()
+                )
             prepared, batch = _plan_mutants(
                 shadow, node, model_path, cap, get_dialect(connector), mutation_mod
             )
@@ -1087,7 +1118,7 @@ def test_mutations(
                 node,
                 model_path,
                 batch,
-                select=model,
+                select=below.select,
                 requested=check_equivalence,
                 paradigm=paradigm,
                 connector=connector,
@@ -1106,6 +1137,8 @@ def test_mutations(
                     node,
                     mutation_mod,
                     equivalence=equivalence,
+                    reads=below.selected_ids,
+                    skip=below.excluded_names,
                 )
                 warnings.extend(price_notes)
                 if estimate is not None:
@@ -1133,6 +1166,7 @@ def test_mutations(
                 equivalence=equivalence,
                 uptime=getattr(adapter, "warehouse_uptime", None),
                 adapter=adapter,
+                downstream=below,
             )
             runs, spend, run_warnings = result.pop("_meta")
             warnings.extend(run_warnings)
@@ -1150,6 +1184,7 @@ def test_mutations(
         warnings.extend(skipped_handshake_warning(paradigm, engine.confirmed))
 
     warnings.extend(_survivor_warnings(result["counts"], result["equivalence"]))
+    warnings.extend(below.warnings(result["counts"]))
     if batch.elided_total:
         warnings.append(
             f"{batch.elided_total} further mutant(s) were not run: the cap is "
@@ -1163,6 +1198,7 @@ def test_mutations(
         mutants=result["mutants"],
         counts=result["counts"],
         score=result["score"],
+        score_with_downstream=result["score_with_downstream"],
         cap={
             "limit": batch.cap,
             "generated": len(batch.mutants),
@@ -1171,6 +1207,7 @@ def test_mutations(
         },
         runs=runs,
         equivalence=result["equivalence"],
+        downstream=below.summary(),
         spend=spend,
         cost=_mutation_cost(paradigm, estimate, ceiling, adapter),
         warnings=warnings,
@@ -1248,6 +1285,8 @@ def _mutable_model(engine, shadow, model: str, mutation_mod):
     view = load_project(shadow.project)
     path = model_file(view, model)
     content = view.files[path].content
+    if hasattr(shadow, "strip_semantic_models"):
+        shadow.strip_semantic_models(model)
     # The header is appended rather than prepended: dbt gives a scalar config key
     # to the last `config()` call in a file, so a model declaring its own
     # `materialized` would otherwise win and the mutant would build a relation.
@@ -1284,16 +1323,6 @@ def _mutable_model(engine, shadow, model: str, mutation_mod):
             f"dex could not make '{model}' ephemeral for the run (it compiled as "
             f"{(node.get('config') or {}).get('materialized')}), and it will not "
             "run mutants that would materialize into your dev target"
-        )
-    if not _attached_tests(manifest, node):
-        # Free, and the more useful answer than "nothing to mutate": with no test
-        # to catch anything, every mutant survives by construction and the run
-        # would spend N dbt invocations to say so.
-        raise mutation_mod.MutationError(
-            f"'{model}' has no tests, so there is nothing to measure: every "
-            "planted defect would survive by construction. Write one first "
-            f"(`transform test --scaffold {model}` scaffolds a unit test), "
-            "then measure it"
         )
     return node, path
 
@@ -1373,7 +1402,16 @@ _EQUIVALENCE_LINE = "(equivalence checks, if every mutant survives)"
 
 
 def _price_mutations(
-    adapter, shadow, model_path, batch, node, mutation_mod, *, equivalence=None
+    adapter,
+    shadow,
+    model_path,
+    batch,
+    node,
+    mutation_mod,
+    *,
+    equivalence=None,
+    reads: set[str] | None = None,
+    skip: frozenset[str] | set[str] = frozenset(),
 ):
     """Price the whole batch upfront, per statement, as one number to confirm.
 
@@ -1393,9 +1431,18 @@ def _price_mutations(
     stop rule asks the uptime model what is still owed instead, because that
     figure grows with the time between runs rather than with any one of them.
 
+    Only the tests a run selects are priced: ``reads`` is the set of models the
+    selection names (the mutated model, plus the downstream models the mutant
+    is routed through), and a test reading none of them never runs, which is
+    the same rule dbt's eager selection applies. ``skip`` names the tests the
+    runs exclude by name (a downstream test that reads a relation the mutant
+    cannot reach), which are priced at nothing for the same reason.
+
     Returns the total, the per-table lines the handshake shows, the price of
     each statement keyed the way the run loop asks for it, and notes.
     """
+
+    from ..dbt_project import manifest_node_label
 
     translate = getattr(adapter, "compute_spend_translation", None)
     if translate is not None:
@@ -1413,9 +1460,15 @@ def _price_mutations(
 
     manifest = shadow.manifest()
     tests = [
-        node.get("compiled_code")
-        for node in manifest.get("nodes", {}).values()
-        if node.get("resource_type") == "test" and node.get("compiled_code")
+        test.get("compiled_code")
+        for uid, test in manifest.get("nodes", {}).items()
+        if test.get("resource_type") == "test"
+        and test.get("compiled_code")
+        and manifest_node_label(uid, test) not in skip
+        and (
+            reads is None
+            or reads & set((test.get("depends_on") or {}).get("nodes") or [])
+        )
     ]
     notes: list[str] = []
     if not tests:
@@ -1503,14 +1556,22 @@ def _run_mutants(
     equivalence: _EquivalenceCheck | None = None,
     uptime=None,
     adapter=None,
+    downstream: _DownstreamTests | None = None,
 ):
     """The baseline, then one run per mutant, stopping if the budget runs out.
 
     A survivor is compared with the model on the dev data straight after its
     own run, while its body is still the model file, so the comparison costs
     one dbt invocation and no rewrite.
+
+    ``downstream`` widens every run, the baseline included, to the tests on the
+    models the mutant is routed through, and tells :func:`classify` which tests
+    those are so a catch there is kept apart from one by the model's own tests.
     """
 
+    select = downstream.select if downstream is not None else model
+    exclude = downstream.exclude if downstream is not None else []
+    below = set(downstream.tests) if downstream is not None else set()
     warnings: list[str] = []
     meter = _BatchSpend(
         paradigm=paradigm,
@@ -1526,7 +1587,7 @@ def _run_mutants(
     )
 
     shadow.write(model_path, batch.identity)
-    baseline_summary = shadow.test(model)
+    baseline_summary = shadow.test(select, exclude=exclude)
     meter.settle(baseline_summary, "(baseline)")
     baseline = _test_statuses(baseline_summary)
     excluded = [
@@ -1546,7 +1607,13 @@ def _run_mutants(
         equivalence.run_self_check(meter, mutation_mod)
 
     mutants: list[dict] = []
-    counts = {"killed": 0, "survived": 0, "rejected": 0, "not_run": 0}
+    counts = {
+        "killed": 0,
+        "caught_downstream": 0,
+        "survived": 0,
+        "rejected": 0,
+        "not_run": 0,
+    }
     tested = 0
 
     def stop(remaining) -> None:
@@ -1566,15 +1633,18 @@ def _run_mutants(
             stop(batch.mutants[index:])
             break
         shadow.write(model_path, mutant.body)
-        summary = shadow.test(model)
+        summary = shadow.test(select, exclude=exclude)
         tested += 1
         meter.settle(summary, mutant.id)
-        verdict = mutation_mod.classify(baseline, _test_statuses(summary))
+        verdict = mutation_mod.classify(
+            baseline, _test_statuses(summary), downstream=below
+        )
         counts[verdict.outcome] = counts.get(verdict.outcome, 0) + 1
         record = {
             **mutant.payload(),
             "status": verdict.outcome,
             "caught_by": verdict.caught_by,
+            "caught_downstream_by": verdict.caught_downstream,
             "warn_only": verdict.warn_only,
             "equivalence": None,
         }
@@ -1591,7 +1661,11 @@ def _run_mutants(
             break
 
     mutants.sort(key=lambda m: (_survivor_rank(m), m["id"]))
-    decided = counts["killed"] + counts["survived"]
+    # The model's own score counts a defect only downstream tests caught as a
+    # miss, exactly as it did before they ran: its denominator and numerator
+    # are what they would be without them.
+    decided = counts["killed"] + counts["caught_downstream"] + counts["survived"]
+    routed = downstream is not None and downstream.enabled
     warnings.extend(meter.settle_uptime())
     return {
         "baseline": {
@@ -1604,6 +1678,11 @@ def _run_mutants(
         "mutants": mutants,
         "counts": {"generated": len(batch.mutants), **counts},
         "score": (counts["killed"] / decided) if decided else None,
+        "score_with_downstream": (
+            (counts["killed"] + counts["caught_downstream"]) / decided
+            if decided and routed
+            else None
+        ),
         "equivalence": equivalence.summary() if equivalence is not None else None,
         "_meta": (meter.runs, meter.spend, warnings),
     }
@@ -1615,14 +1694,18 @@ def _survivor_rank(mutant: dict) -> int:
     Survivors lead, and among them the ones the dev data already tells apart
     come first, since an assertion over that data catches them today. An
     unlabelled survivor ranks above an equivalent one, because a comparison
-    that never ran is no grounds for demoting it.
+    that never ran is no grounds for demoting it. A defect only downstream tests
+    caught comes next: the model's own suite missed it, but nothing needs
+    writing for it to stop shipping.
     """
 
     status = mutant.get("status")
     if status == "survived":
         label = (mutant.get("equivalence") or {}).get("status")
         return {"distinguishable": 0, "equivalent": 2}.get(label, 1)
-    return {"not_run": 3, "rejected": 4, "killed": 5}.get(status, 9)
+    return {"caught_downstream": 3, "not_run": 4, "rejected": 5, "killed": 6}.get(
+        status, 9
+    )
 
 
 class _BatchSpend:
@@ -1736,6 +1819,287 @@ class _BatchSpend:
 
     def _price(self, key: str) -> float:
         return self._prices.get(key, self._fallback)
+
+
+class _DownstreamTests:
+    """The tests on the models downstream of the mutant, and how a run reaches them.
+
+    A defect in an intermediate model ships only if every test in the project
+    misses it, and the tests most likely to pin what a model feeds are often on
+    the mart that reads it. dex routes each mutant to them the way it keeps the
+    mutant from materializing: every model downstream that can carry it is made
+    ephemeral in the copy too, so dbt inlines the whole chain, mutant at the
+    bottom, into each of their tests, and nothing is built.
+
+    A class for the same reason :class:`_EquivalenceCheck` is one: it decides
+    once whether the routing is on and holds that decision, with its reason,
+    for the selection every run uses, the pricing, and the envelope. Off is a
+    state with a reason, never an absence.
+
+    ``direct`` names the model's own tests, which are what they always were.
+    ``tests`` names the downstream tests that run, and ``exclude`` is what the
+    selection drops: a unit test on a downstream model (it reads its fixtures,
+    never the mutant), and a test that also reads a downstream relation the
+    mutant cannot reach, since that relation still holds the unmutated rows
+    and the test would compare two versions of the model with each other.
+    """
+
+    def __init__(
+        self,
+        model: str,
+        direct: set[str],
+        *,
+        requested: bool | None,
+        reason: str | None = None,
+    ):
+        self.model = model
+        self.model_id = ""
+        self.routed_ids: list[str] = []
+        self.direct = direct
+        self.requested = requested
+        self.reason = reason
+        self.models: list[str] = []
+        self.tests: list[str] = []
+        self.exclude: list[str] = []
+        self.excluded: list[dict[str, str]] = []
+        self.cut: list[dict[str, str]] = []
+        self.elided = 0
+        self.opt_in = False
+
+    @classmethod
+    def prepare(
+        cls,
+        shadow,
+        node: dict,
+        *,
+        model: str,
+        requested: bool | None,
+        paradigm,
+        connector: str,
+        mutation_mod,
+    ) -> _DownstreamTests:
+        """Make the downstream models ephemeral in the copy, or say why not.
+
+        Read from the manifest the model's own compile already wrote, so a run
+        with nothing downstream, or one where the routing is off, costs no
+        further dbt invocation. Where it is on, the rewritten models are
+        compiled with the model before anything is priced, and the routing is
+        dropped, with every file put back, if dbt would not compile them or
+        compiled any of them as anything but ephemeral: a model downstream must
+        never be the reason the copy stops compiling, and must never be built.
+        """
+
+        from ..dbt_project import manifest_node_label
+        from ..envelope import Paradigm
+        from .build import DbtRunError
+
+        manifest = shadow.manifest()
+        nodes = manifest.get("nodes", {})
+        direct_ids = set(_attached_tests(manifest, node))
+        direct = {manifest_node_label(uid, nodes.get(uid)) for uid in direct_ids}
+        check = cls(model, direct, requested=requested)
+        check.model_id = node.get("unique_id", "")
+        if requested is False:
+            check.reason = "the downstream tests are off (--no-downstream)"
+            return check
+        if requested is None and paradigm is not Paradigm.FREE_LOCAL:
+            check.opt_in = True
+            check.reason = (
+                f"running the tests of the models downstream of '{model}' costs "
+                f"{connector} spend, since each one recomputes the mutant beneath "
+                "it, so it is opt-in: re-run with --downstream to price them into "
+                "the same batch"
+            )
+            return check
+
+        unique_id = node.get("unique_id", "")
+        closure = mutation_mod.downstream_closure(manifest, unique_id)
+        check.cut = [
+            {"name": entry["name"], "reason": entry["reason"]} for entry in closure.cut
+        ]
+        check.elided = closure.elided
+        eligible = set(closure.eligible)
+        stale = _descendants(manifest, unique_id) - eligible
+
+        for uid, test in sorted(nodes.items()):
+            if test.get("resource_type") != "test" or uid in direct_ids:
+                continue
+            reads = set((test.get("depends_on") or {}).get("nodes") or [])
+            if not reads & eligible:
+                continue
+            name = manifest_node_label(uid, test)
+            unreachable = sorted(reads & stale)
+            if unreachable:
+                other = manifest_node_label(unreachable[0], nodes.get(unreachable[0]))
+                check.exclude.append(name)
+                check.excluded.append(
+                    {
+                        "name": name,
+                        "reason": (
+                            f"it also reads {other}, which the mutant cannot "
+                            "reach, so it would compare the mutant with the "
+                            "unmutated model"
+                        ),
+                    }
+                )
+                continue
+            check.tests.append(name)
+        for uid, unit in sorted((manifest.get("unit_tests") or {}).items()):
+            if uid in direct_ids:
+                continue
+            reads = set((unit.get("depends_on") or {}).get("nodes") or [])
+            if not reads & eligible:
+                continue
+            name = unit.get("name") or manifest_node_label(uid)
+            check.exclude.append(f"unit_test:{name}")
+            check.excluded.append(
+                {
+                    "name": manifest_node_label(uid),
+                    "reason": (
+                        "a unit test reads its fixtures rather than the model "
+                        "beneath it, so it cannot see the mutant"
+                    ),
+                }
+            )
+
+        if not check.tests:
+            check.exclude = []
+            if not closure.eligible and not closure.cut:
+                check.reason = f"no model in this project reads '{model}'"
+            elif not closure.eligible:
+                first = closure.cut[0]
+                check.reason = (
+                    f"no model downstream of '{model}' can carry the mutant: "
+                    f"{first['name']}: {first['reason']}"
+                )
+            else:
+                check.reason = (
+                    f"the models downstream of '{model}' have no data tests that "
+                    "would read the mutant"
+                )
+            return check
+
+        labels = [manifest_node_label(uid, nodes.get(uid)) for uid in closure.eligible]
+        originals: dict[str, str] = {}
+        root = shadow.shadow
+        try:
+            for uid in closure.eligible:
+                path = (nodes.get(uid) or {}).get("original_file_path") or ""
+                text = (root / path).read_text(encoding="utf-8")
+                shadow.write(path, text + "\n" + mutation_mod.EPHEMERAL_HEADER + "\n")
+                originals[path] = text
+        except Exception:
+            check._restore(shadow, originals, model)
+            check.reason = (
+                f"dex could not rewrite the models downstream of '{model}' in the "
+                "copy, so only its own tests run"
+            )
+            return check
+
+        select = " ".join([model, *labels])
+        try:
+            compiled = shadow.compile(select)
+        except DbtRunError:
+            check._restore(shadow, originals, model)
+            check.reason = (
+                f"the models downstream of '{model}' would not compile as "
+                "ephemeral in the copy, so only its own tests run"
+            )
+            return check
+        for uid, label in zip(closure.eligible, labels, strict=True):
+            materialized = (
+                (compiled.get("nodes", {}).get(uid) or {}).get("config") or {}
+            ).get("materialized")
+            if materialized != "ephemeral":
+                check._restore(shadow, originals, model)
+                check.reason = (
+                    f"dex could not make '{label}' ephemeral for the run (it "
+                    f"compiled as {materialized}), and it will not route a mutant "
+                    "through a model that would materialize into your dev target"
+                )
+                return check
+        check.models = labels
+        check.routed_ids = list(closure.eligible)
+        return check
+
+    @property
+    def enabled(self) -> bool:
+        return self.reason is None
+
+    @property
+    def select(self) -> str:
+        """The one ``--select`` every run uses: the model, plus the routed chain."""
+
+        return " ".join([self.model, *self.models]) if self.enabled else self.model
+
+    @property
+    def selected_ids(self) -> set[str]:
+        """The models the selection names, by unique id, for pricing."""
+
+        return {self.model_id, *(self.routed_ids if self.enabled else [])}
+
+    @property
+    def excluded_names(self) -> set[str]:
+        return {entry["name"] for entry in self.excluded} if self.enabled else set()
+
+    def no_tests_hint(self) -> str:
+        """What to add to the no-tests refusal when downstream tests were not run."""
+
+        if not self.opt_in:
+            return ""
+        return ". Tests on the models downstream of it count too, with --downstream"
+
+    def warnings(self, counts: dict) -> list[str]:
+        caught = counts.get("caught_downstream", 0)
+        if not self.enabled or not caught:
+            return []
+        return [
+            f"{caught} planted defect(s) the model's own tests missed were caught "
+            "by tests on the models downstream of it, so they could not ship. "
+            "data.score still counts them as misses, since it answers for the "
+            "model's own suite; data.score_with_downstream counts them as caught"
+        ]
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "requested": self.requested,
+            "reason": self.reason,
+            "models": list(self.models),
+            "tests": sorted(self.tests) if self.enabled else [],
+            "excluded": self.excluded if self.enabled else [],
+            "cut": self.cut,
+            "elided": self.elided,
+        }
+
+    def _restore(self, shadow, originals: dict[str, str], model: str) -> None:
+        for path, text in originals.items():
+            shadow.write(path, text)
+        # Nothing downstream runs now, so nothing downstream may count: not as
+        # a test that answers for a model with none of its own, and not in
+        # the selection.
+        self.tests = []
+        self.exclude = []
+        self.excluded = []
+        if originals:
+            shadow.compile(model)
+
+
+def _descendants(manifest: dict, unique_id: str) -> set[str]:
+    """Every node downstream of ``unique_id``, transitively, through ``child_map``."""
+
+    children = manifest.get("child_map") or {}
+    found: set[str] = set()
+    frontier = [unique_id]
+    while frontier:
+        frontier = [
+            child
+            for parent in frontier
+            for child in children.get(parent, [])
+            if child not in found
+        ]
+        found.update(frontier)
+    return found
 
 
 class _EquivalenceCheck:
@@ -2044,6 +2408,7 @@ def cmd_test(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     scaffold = getattr(args, "scaffold", None)
     mutate = getattr(args, "mutate", None)
     check_equivalence = getattr(args, "check_equivalence", None)
+    downstream = getattr(args, "downstream", None)
     try:
         if scaffold and mutate:
             raise ValueError(
@@ -2055,6 +2420,11 @@ def cmd_test(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
                 "--check-equivalence and --no-check-equivalence label the "
                 "survivors of a mutation run, so they need --mutate <model>"
             )
+        if downstream is not None and not mutate:
+            raise ValueError(
+                "--downstream and --no-downstream decide which tests answer for "
+                "a mutation run, so they need --mutate <model>"
+            )
         if mutate:
             return to_envelope(
                 test_mutations(
@@ -2063,6 +2433,7 @@ def cmd_test(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
                     max_mutants=getattr(args, "max_mutants", None),
                     target=getattr(args, "target", None),
                     check_equivalence=check_equivalence,
+                    downstream=downstream,
                 )
             )
         result = test_scaffold(engine, scaffold)
@@ -2680,12 +3051,12 @@ def build(
                 *price_notes,
                 *no_session_ceiling_warning(
                     paradigm,
-                    config.budget.session_ceiling,
-                    declined=config.budget.session_ceiling_declined,
+                    config.session_ceiling_in_force,
+                    declined=config.session_ceiling_declined_in_force,
                 ),
                 *unserialized_ledger_warning(
                     paradigm,
-                    config.budget.session_ceiling,
+                    config.session_ceiling_in_force,
                     callable(getattr(store, "spend_lock", None)),
                 ),
             ],
@@ -2721,8 +3092,8 @@ def build(
             *command_args.upper_bound_notes(upper_bounds, per_node),
             *dev_warnings,
         ],
-        session_ceiling=config.budget.session_ceiling,
-        session_ceiling_declined=config.budget.session_ceiling_declined,
+        session_ceiling=config.session_ceiling_in_force,
+        session_ceiling_declined=config.session_ceiling_declined_in_force,
         gate=command_args.cost_gate(adapter) if adapter is not None else None,
         adapter=adapter,
         verification=verification,
@@ -3515,8 +3886,10 @@ def _shape_build_result(
         and _execution_seconds(summary) > 0
     ):
         uptime_notes = [_UNMODELED_UPTIME_NOTES[connector]]
+    informational: list[str] = []
     if verification is not None:
         notes = [*notes, *verification.warnings]
+        informational = list(verification.notes)
         if verification.findings:
             notes = [
                 *notes,
@@ -3561,6 +3934,7 @@ def _shape_build_result(
             evidence=evidence,
             cost=cost,
             spend=spend,
+            notes=informational,
             warnings=[*notes, *messages],
             decisions=decisions,
         )
@@ -3590,6 +3964,7 @@ def _shape_build_result(
         evidence=evidence,
         cost=cost,
         spend=spend,
+        notes=informational,
         warnings=[*notes, *(messages[1:] if messages else [])],
         decisions=decisions,
     )
@@ -3699,13 +4074,16 @@ def _semantic_plan(
     # back out of it: a removal's effect is the absence of something, which the
     # content it produces cannot state.
     removed: list[semantic_mod.DefinitionEdit] = []
+    placement_notes: list[str] = []
     if definitions:
         # Lowered to the whole-file unit before anything else looks at them, so
         # the validation, classification, parse gate, and plan store below stay
         # on one code path regardless of how the caller expressed the change.
         edits = [
             PlanEdit(path=path, kind=EditKind.SEMANTIC_YML, new_content=content)
-            for path, content in _semantic().splice_definitions(definitions, view)
+            for path, content in _semantic().splice_definitions(
+                definitions, view, notes=placement_notes
+            )
         ]
         scope = {(d.kind, d.name) for d in definitions}
         removed = [d for d in definitions if d.op is EditOp.DELETE]
@@ -3745,6 +4123,7 @@ def _semantic_plan(
         removed, [(e.path, e.new_content or "") for e in edits], view
     )
     spine_warning = _semantic().time_spine_warning(view, parsed_edits)
+    period_agg_warnings = _semantic().cumulative_period_agg_warnings(parsed_edits)
 
     # Declarations render after the semantic-only checks above, because what they
     # produce is a model's properties (`schema_yml`), not a semantic definition,
@@ -3793,8 +4172,10 @@ def _semantic_plan(
             "every definition in this payload is identical to the project's "
             "current content, so this plan changes nothing"
         )
+    result.warnings.extend(placement_notes)
     if spine_warning:
         result.warnings.append(spine_warning)
+    result.warnings.extend(period_agg_warnings)
     if parse_warning:
         result.warnings.append(parse_warning)
     result.warnings.extend(parse_deprecations)

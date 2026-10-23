@@ -72,5 +72,9 @@ for skill in explore transform maintain; do
     "${ROOT}/skills/${skill}/scripts/run.py"
   rm -f "${ROOT}/skills/${skill}/scripts/run.py.bak"
 done
+sed -i.bak -E \
+  "s/^fallback_version = \"[^\"]*\"/fallback_version = \"${VERSION}\"/" \
+  "${ROOT}/packages/dex-core/pyproject.toml"
+rm -f "${ROOT}/packages/dex-core/pyproject.toml.bak"
 
 echo "==> done. Review the bumped pins, then revert before committing if this was a dry run."

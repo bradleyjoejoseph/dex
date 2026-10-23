@@ -36,6 +36,8 @@ jobs:
   # safety-critical assertion is unmistakable in the checks list. Strict: an
   # unexpected pass (a placeholder going green early) is fine; a real
   # failure blocks the merge regardless of any benchmark score.
+  # Select a tested Python explicitly: ubuntu-latest's system Python moved to
+  # 3.14, which the locked dbt/Mashumaro stack cannot import under.
   safety:
     runs-on: ubuntu-latest
     defaults:
@@ -46,6 +48,7 @@ jobs:
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
+          python-version: "3.12"
       - name: Sync (duckdb + bigquery + snowflake + databricks + postgres + redshift + clickhouse + trino + dev extras)
         run: uv sync --extra duckdb --extra bigquery --extra snowflake --extra databricks --extra postgres --extra redshift --extra clickhouse --extra trino --extra dev
       - name: Safety-critical assertions
@@ -74,6 +77,7 @@ jobs:
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
+          python-version: "3.12"
       - name: Resolve [sql,slayer] fresh from the declared ranges
         run: |
           uv run --isolated --no-project --with ".[sql,slayer]" python -c \

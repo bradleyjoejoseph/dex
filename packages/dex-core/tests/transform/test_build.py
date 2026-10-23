@@ -430,6 +430,51 @@ def test_build_failure_names_the_cause_behind_a_whole_run_fatal(
     )
 
 
+def test_build_failure_surfaces_validation_error_details(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Pydantic validation errors include the field and rule that failed on
+    the lines following the header; keeping only the generic header left the
+    cause hidden (issue #727)."""
+
+    real_error = (
+        "Encountered an error:\n"
+        "1 validation error for PydanticSemanticModel\n"
+        "node_relation -> relation_name\n"
+        "  none is not an allowed value (type=type_error.none.not_allowed)"
+    )
+    lines = [
+        json.dumps(
+            {
+                "info": {
+                    "level": "error",
+                    "name": "MainEncounteredError",
+                    "msg": real_error,
+                }
+            }
+        ),
+    ]
+    _fake_runner_factory(monkeypatch, returncode=2, stdout="\n".join(lines))
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert envelope["errors"][0] == (
+        "dbt build failed: Encountered an error: 1 validation error for "
+        "PydanticSemanticModel: node_relation -> relation_name: "
+        "none is not an allowed value (type=type_error.none.not_allowed)"
+    )
+
+
 def test_build_failure_message_strips_ansi_color_codes(
     dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
 ):
@@ -2477,6 +2522,51 @@ def test_a_billed_build_under_a_cumulative_cap_stays_quiet(
     )
     assert rc == 0, envelope
     assert [w for w in envelope["warnings"] if "budget.session_ceiling" in w] == []
+
+
+def test_a_billed_build_under_a_host_cap_alone_stays_quiet(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """#787: a host's cap bounds the day even where the file sets no ceiling, so
+    the build must not say the day is unbounded."""
+
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.session_cap import SESSION_CEILING_CAP_ENV
+
+    monkeypatch.setenv(SESSION_CEILING_CAP_ENV, "1000000000")
+    _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=5_000_000.0,
+        per_node={"stg_customers": 5_000_000.0},
+        confirmed=True,
+        ceiling=100_000_000,
+    )
+    _fake_runner_factory(monkeypatch, returncode=0)
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+            "--budget",
+            "100000000",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert [w for w in envelope["warnings"] if "budget.session_ceiling" in w] == []
+    assert envelope["data"]["session_ceiling_cap"] == {
+        "value": 1_000_000_000.0,
+        "unit": "bytes",
+        "source": "environment",
+    }
 
 
 def test_a_running_build_holds_its_headroom_and_gives_it_back(

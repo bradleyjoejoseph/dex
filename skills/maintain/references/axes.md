@@ -29,6 +29,10 @@ fingerprints of the dbt project and of the semantic layer.
 - Past 50 objects, `explore map` profiles the top 25 by rank and enters the rest
   as metadata alone. The snapshot envelope reports `column_detail_count` against
   `dataset_count` plus a warning naming what it could not cover.
+- The baseline records the engine release that wrote it (`tool_version`). Every
+  axis that reads it warns when that release is not the running one, because
+  drift measured across an engine change can reflect the engine as well as the
+  warehouse. Re-running `maintain snapshot` re-pins it at the running release.
 - `--project-only` refreshes the transform and semantic fingerprints without
   opening the warehouse, carrying the existing `warehouse` block,
   `warehouse_from`, and `cache_updated_at` forward. It requires an existing
@@ -116,7 +120,10 @@ Needs no baseline. Two classes of finding:
   for the shortfall; `row_fanout` where it holds materially more. Each names the
   join and its key and states both counts. A model with a `WHERE`, `GROUP BY`,
   `DISTINCT`, `QUALIFY`, `LIMIT`, a semi or anti join, or a set operation is never
-  reported for loss, and an incremental model is skipped outright.
+  reported for loss, and an incremental model is skipped outright. A model that
+  generates its rows in SQL, such as `range(...)` or a `VALUES` clause, has no
+  parent relation. That is named in `notes`. A real parent relation that is
+  absent from the warehouse is still a warning.
 
 A project that does not compile is reported first and suppresses everything
 else. `data.suppressed` names every class that did not run and why.

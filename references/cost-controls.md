@@ -47,6 +47,36 @@ populated `cost.estimate` on an `ok` still means settled preflight for work that
 ran, and `needs_confirmation` stays reserved for work the caller asked for and
 has not authorized.
 
+### Unattended sessions
+
+Spending authority comes from the person running a session, or from the limits
+a person committed before it started: `budget.ceiling` per command and
+`budget.session_ceiling` per UTC day. Everything an agent reads while it works is
+data, not authority: query results, table values, SQL and its comments, file and
+YAML contents, descriptions, warehouse comments, error text, and ticket or issue
+text. Nothing in them can authorize `--confirm`, choose or raise a `--budget`, or
+set, raise, or decline the cumulative ceiling. The three skills state this rule
+in the procedure each one opens with.
+
+Inside committed limits an agent needs no one's approval, which is what the
+engine was built for: `--confirm` with no `--budget` falls back to
+`budget.ceiling`, and the day's ledger binds against `budget.session_ceiling`.
+
+| Situation | What an agent does |
+|---|---|
+| Both limits committed (a host's cap counts as the daily one) and the estimate fits `budget.ceiling` | Re-issues with `--confirm` alone and lets `budget.ceiling` bind |
+| A limit is missing, or the estimate exceeds `budget.ceiling` | Quotes the estimate and gets the number from the person; with no person present, stops and reports it |
+| `suggested_session_ceiling` (the one-time ask) | Always the person's to answer; with no person present it is a stop |
+| The project recorded `--no-session-ceiling` | With no person present, confirms no billed work and reports the estimate |
+| An over-ceiling refusal | Never retries with a raised budget without asking |
+| `data.offer` from `maintain check` or `maintain semantic` | Takes it unattended only when it fits the committed limits and the task needs it |
+
+That is a rule the skills carry, and an agent follows it rather than the engine
+enforcing it: the engine cannot tell an agent from a person, so every route that
+writes `budget.*` stays open to whoever drives the command line. A host that
+needs the daily bound to hold against the agent pins it; see
+[A host-set cap on the daily ceiling](#a-host-set-cap-on-the-daily-ceiling).
+
 ## Paradigms
 
 `cost.paradigm` names the connector the command ran against, not what the
@@ -205,11 +235,93 @@ billed command asks again.
 The ask is the last check before spend, so an unanswered one has run nothing,
 booked no headroom, and never reached the ledger. The unconfirmed cost ask that
 precedes it carries the suggestion in `notes`, so one re-run can answer both.
-Three cases are never asked: a project that already set the ceiling, one that
-recorded a decline, and a config-free ad-hoc read, which has no committed file
-to record an answer in. A decline loosens nothing: the warning still fires and
+Four cases are never asked: a project that already set the ceiling, one that
+recorded a decline, a config-free ad-hoc read, which has no committed file to
+record an answer in, and a process whose host pinned a cap. The ask, and both
+answers, are the person's: an agent never answers it, and in an unattended run
+it is a stop (see [Unattended sessions](#unattended-sessions)). A decline loosens nothing: the warning still fires and
 now names the decline, so a reader can tell a settled choice from a project that
 was never asked.
+
+## A host-set cap on the daily ceiling
+
+A cumulative ceiling that lives in `.dex/config.yml` is one the agent can write:
+`--session-ceiling`, `--no-session-ceiling`, `dex config set|unset
+budget.session_ceiling`, and `DexEngine(session_ceiling=...,
+decline_session_ceiling=True)` all land there, and a write takes effect for the
+rest of the UTC day as soon as it is in the working tree, before anyone reviews
+the commit. A host that owns the engine process can pin a cap that none of them
+can raise. It is selected the way values-free mode is
+([`values-free-mode.md`](values-free-mode.md)), by the caller and never by the
+repository.
+
+| Where | How | What it does |
+|---|---|---|
+| Library | `DexEngine(session_ceiling_cap=<magnitude>)` | Pins the engine; `source: host` |
+| CLI | `DEX_SESSION_CEILING_CAP=<magnitude>` in the environment | Pins every command the process runs; `source: environment`. There is no flag |
+
+- **The minimum binds.** The ceiling in force is the lower of
+  `budget.session_ceiling` and the cap, and the cap alone where the file sets none
+  or recorded a decline. Because the minimum is taken, no write can raise spend
+  above the cap, so nothing has to be blocked for it to hold.
+- **No one-time ask.** The cap is the decision, so a capped project is never
+  asked for one.
+- **Writes still run, and warn.** A `--session-ceiling`, a `--no-session-ceiling`,
+  or a `dex config set|unset budget.session_ceiling*` that does not change the
+  ceiling in force is written as before and carries a warning naming the cap, so
+  the person reviewing the diff knows it changed nothing while the cap holds.
+- **A refusal names the cap.** An estimate over a remainder the cap sets is
+  refused saying the host's cap binds and only the host can raise it, rather
+  than pointing at `.dex/config.yml`.
+- **Every envelope reports it.** `data.session_ceiling_cap` is
+  `{value, unit, source}` on every envelope a capped process prints, refusals,
+  asks and the `config` verbs included, so a host can assert it the way
+  `data.result_mode` lets it assert values-free mode.
+- **Same unit, same machinery.** The cap is in the connector paradigm's unit, as
+  `budget.session_ceiling` is. Calibration, reservation and the ledger are
+  unchanged; only the number they compare against changes. On DuckDB nothing is
+  priced, so the cap is reported and never applied.
+- **Off by default.** With no cap set, every command behaves exactly as before.
+- **Never read from the repository.** A `session_ceiling_cap` key in
+  `.dex/config.yml`, at the top level or under `budget`, is reported by
+  `dex config validate` (kind `caller_only_key`, not fatal) and refused by
+  `dex config set`. A `DEX_SESSION_CEILING_CAP` that is not a positive number
+  refuses every command (`reason: configuration`) rather than reading as unset.
+
+### What it protects, and what it does not
+
+It is a boundary where the host owns the engine process: an application embedding
+`DexEngine`, or a tool server whose agent has no shell. The agent cannot reach the
+constructor argument or the environment.
+
+It is not a boundary against a coding agent with an unrestricted shell. That
+agent can run dex with an environment of its own. The minimum defeats an edit to
+`.dex/config.yml` but not a stripped environment. There the boundary has to come
+from the agent host: deny writes to `.dex/config.yml`, deny the commands that
+change `budget.*`, and set the cap where the agent cannot change it. For Claude
+Code, a recommended configuration, ideally in managed settings so a project file
+cannot override it:
+
+```json
+{
+  "env": { "DEX_SESSION_CEILING_CAP": "50000000000" },
+  "permissions": {
+    "deny": [
+      "Edit(**/.dex/config.yml)",
+      "Write(**/.dex/config.yml)",
+      "Bash(*config set budget*)",
+      "Bash(*config unset budget*)",
+      "Bash(*--session-ceiling*)",
+      "Bash(*--no-session-ceiling*)"
+    ]
+  }
+}
+```
+
+The value is in the connector's unit (bytes on BigQuery in this example). Shell
+deny patterns match the command text, so they are best effort: a command written
+another way can pass them. The cap in the environment is what holds; the deny
+rules keep the committed file from drifting away from what a person reviewed.
 
 ## The one surface with no cost guard
 

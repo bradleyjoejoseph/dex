@@ -57,6 +57,7 @@ from ..config import (
     blob_override_paths,
     pii_override_paths,
 )
+from ..engine_version import state_version_warning
 from ..errors import DexError, PrerequisiteError, RequestError
 from ..guards.cost_guard import (
     ConfirmationRequiredError,
@@ -813,7 +814,10 @@ def profile(
         show_all_columns=show_all_columns,
         value_domain_cap=config.profile_value_domain_cap,
         notes=notes,
-        warnings=_override_mismatches(datasets, config.pii_overrides),
+        warnings=[
+            *_prior_cache_warnings(prior),
+            *_override_mismatches(datasets, config.pii_overrides),
+        ],
         pending_confirmation=cumulative_pending,
         result_mode=mode,
     )
@@ -880,7 +884,7 @@ def relationships(
     verify_warning: str | None = None
     overlap_pending: ConfirmationRequest | None = None
     overlap_warning: str | None = None
-    warnings: list[str] = []
+    warnings: list[str] = _prior_cache_warnings(prior)
 
     # Relationship inference needs uniqueness signals, so profile every object
     # first (free and local on DuckDB), then infer across the full set.
@@ -2249,7 +2253,7 @@ def map(
     verify_warning: str | None = None
     overlap_pending: ConfirmationRequest | None = None
     overlap_warning: str | None = None
-    warnings: list[str] = []
+    warnings: list[str] = _prior_cache_warnings(prior)
 
     metas = inventory_mod.inventory(adapter)
     orphaned = _orphan_candidates(metas, defs)
@@ -4815,6 +4819,27 @@ def _budget_exhausted(
         spend=spend,
         cost=cost,
     )
+
+
+def _prior_cache_warnings(prior: DexCache | None) -> list[str]:
+    """Say so when the cache this run reads was written by another engine (#731).
+
+    A run folds the profiles it does not re-scan in from that cache, so they
+    reach this run's answer as another release computed them. The write that
+    follows stamps this engine, so the warning appears once per switch rather
+    than on every run.
+    """
+
+    if prior is None:
+        return []
+    warning = state_version_warning(
+        "the exploration cache",
+        prior.provenance.tool_version,
+        "a profile this run reuses rather than re-scans was computed by that "
+        "engine, and `explore profile <object> --refresh` recomputes it with "
+        "this one",
+    )
+    return [warning] if warning else []
 
 
 _KEEP_RELATIONSHIPS = object()

@@ -37,7 +37,13 @@ from .config_document import (
 )
 from .errors import ConfigurationError, RequestError
 from .results import ConfirmationRequest, Result, to_envelope
-from .values_free import CALLER_ONLY_KEYS, CALLER_ONLY_MESSAGE
+from .session_cap import (
+    SESSION_CEILING_CAP_ENV,
+    SessionCeilingCap,
+    moot_write_warning,
+    parse_session_ceiling_cap,
+)
+from .values_free import caller_only_message
 
 # Flags every subcommand accepts that change one run rather than the project.
 # The config verbs read and write the committed file and build no engine, so
@@ -141,7 +147,11 @@ def config_validate(root: Path | str) -> ConfigValidationResult:
 
 
 def config_set(
-    root: Path | str, pairs: list[str], *, confirmed: bool
+    root: Path | str,
+    pairs: list[str],
+    *,
+    confirmed: bool,
+    session_cap: SessionCeilingCap | None = None,
 ) -> ConfigChangeResult:
     """Set one or more keys, as a diff to confirm and then as a write.
 
@@ -168,9 +178,11 @@ def config_set(
     if repeated := sorted({key for key in keys if keys.count(key) > 1}):
         raise RequestError(f"{', '.join(repeated)} is set more than once in one call")
     if caller_only := sorted(
-        {key for key in keys if key.split(".", 1)[0] in CALLER_ONLY_KEYS}
+        {key for key in keys if caller_only_message(key) is not None}
     ):
-        raise RequestError(f"{', '.join(caller_only)} {CALLER_ONLY_MESSAGE}")
+        raise RequestError(
+            f"{', '.join(caller_only)} {caller_only_message(caller_only[0])}"
+        )
     path = _committed_config(root)
     before = ConfigDocument.read(path)
     after = before
@@ -188,11 +200,17 @@ def config_set(
             notes=["every key already has that value; nothing to change"],
             warnings=before.warnings(),
         )
-    return _propose(path, before, after, changed, confirmed=confirmed)
+    return _propose(
+        path, before, after, changed, confirmed=confirmed, session_cap=session_cap
+    )
 
 
 def config_unset(
-    root: Path | str, keys: list[str], *, confirmed: bool
+    root: Path | str,
+    keys: list[str],
+    *,
+    confirmed: bool,
+    session_cap: SessionCeilingCap | None = None,
 ) -> ConfigChangeResult:
     """Remove one or more keys, as a diff to confirm and then as a write.
 
@@ -269,7 +287,15 @@ def config_unset(
         return ConfigChangeResult(
             path=str(path), notes=notes, warnings=before.warnings()
         )
-    return _propose(path, before, after, removed, confirmed=confirmed, notes=notes)
+    return _propose(
+        path,
+        before,
+        after,
+        removed,
+        confirmed=confirmed,
+        notes=notes,
+        session_cap=session_cap,
+    )
 
 
 def _propose(
@@ -280,6 +306,7 @@ def _propose(
     *,
     confirmed: bool,
     notes: list[str] | None = None,
+    session_cap: SessionCeilingCap | None = None,
 ) -> ConfigChangeResult:
     """A change to the file: refused, proposed as a diff, or written.
 
@@ -306,6 +333,7 @@ def _propose(
         "warnings": [
             *after.edit_warnings,
             *(f"{CONFIG_RELPATH} {problem.describe()}" for problem in after.problems()),
+            *_moot_under_cap(before, after, keys, session_cap),
         ],
         "notes": list(notes or []),
     }
@@ -324,6 +352,41 @@ def _propose(
         )
     after.write(path)
     return ConfigChangeResult(**proposal, written=True)
+
+
+def _moot_under_cap(
+    before: ConfigDocument,
+    after: ConfigDocument,
+    keys: list[str],
+    session_cap: SessionCeilingCap | None,
+) -> list[str]:
+    """The warning a change to the daily ceiling carries when a host's cap
+    (#787) leaves the ceiling in force where it was: the write is proposed and
+    written as asked, and says it is moot while the cap holds."""
+
+    if session_cap is None or not any(
+        key == "budget" or key.startswith("budget.session_ceiling") for key in keys
+    ):
+        return []
+    return moot_write_warning(
+        session_cap,
+        before=_written_ceiling(before),
+        after=_written_ceiling(after),
+        what=f"this change to {', '.join(keys)}",
+    )
+
+
+def _written_ceiling(document: ConfigDocument) -> float | None:
+    """The daily ceiling a document writes, or None where it writes none (or
+    something no command would load, which the problems already report)."""
+
+    value = document.written("budget.session_ceiling")
+    if value is ABSENT or value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def cmd_config(args: argparse.Namespace) -> env.Envelope:
@@ -360,15 +423,24 @@ def cmd_config(args: argparse.Namespace) -> env.Envelope:
                 data=result.data(),
             )
         confirmed = bool(getattr(args, "confirm", False))
+        session_cap = parse_session_ceiling_cap(
+            os.environ.get(SESSION_CEILING_CAP_ENV), source="environment"
+        )
         if args.subcommand == "unset":
             return to_envelope(
                 config_unset(
-                    root, list(getattr(args, "keys", None) or []), confirmed=confirmed
+                    root,
+                    list(getattr(args, "keys", None) or []),
+                    confirmed=confirmed,
+                    session_cap=session_cap,
                 )
             )
         return to_envelope(
             config_set(
-                root, list(getattr(args, "pairs", None) or []), confirmed=confirmed
+                root,
+                list(getattr(args, "pairs", None) or []),
+                confirmed=confirmed,
+                session_cap=session_cap,
             )
         )
     except (InvalidConfigError, ConfigChangeRefusedError) as exc:

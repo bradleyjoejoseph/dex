@@ -231,10 +231,13 @@ dex transform rename <kind>       -> every edit the rename needs, as one plan: t
 dex transform remove <kind> <name>   -> the definition removed, and every read verified gone. Same kinds
   [--edits-file <f>]                 as rename, same refusals. dex authors the removal of the
                                      definition and REFUSES while any read survives, naming each with
-                                     a file and a line; it never rewrites a read, because
-                                     `{% if var('flag') %}` can be dropped or unguarded and only the
-                                     caller knows which. Pass those read edits with --edits-file and
-                                     they are validated and stored in this same plan
+                                     a file and a line. For a scaffolded model ending in a
+                                     trailing `select * from <cte>`, a removed column's definition
+                                     is deleted from that CTE's projection (including its comma).
+                                     Other reads, such as filters or downstream projections, still
+                                     refuse: dex never guesses what those expressions should become.
+                                     Pass hand-authored read edits with --edits-file and they are
+                                     validated and stored in this same plan
 dex transform place <column>      -> where a derived column shared by several models belongs: the
   --targets <m,m> --expr "<sql>"     lowest model in the ref() graph that every target descends from
   [--explain]                        and that already projects the inputs the expression reads. The
@@ -318,7 +321,11 @@ dex transform test --mutate <m>   -> measure the tests <m> already has: plant st
                                      connector the whole batch is priced and confirmed as one number.
                                      Each survivor is compared with the model on the dev data and
                                      labelled equivalent or distinguishable: free and automatic on
-                                     DuckDB, --check-equivalence on BigQuery and Snowflake
+                                     DuckDB, --check-equivalence on BigQuery and Snowflake.
+                                     --downstream also runs the tests of the models that read <m>,
+                                     routed through them as ephemeral models, and reports a defect
+                                     only those caught as caught_downstream: on by default on
+                                     DuckDB, opt-in and priced into the same batch elsewhere
 dex semantic define|update|plan   -> dbt semantic model edits as diffs (fronted by transform);
                                      validated up to and including dbt's own parser; applied with
                                      transform apply like any other plan
@@ -362,7 +369,9 @@ dex maintain verify [<selector>]  -> is the project correct right now, no .dex/s
                                      the compiled SQL through its CTE chain, naming the join and its
                                      key and stating both counts; a model with a filter, aggregate,
                                      de-duplication or set operation is never reported for loss, and an
-                                     incremental model is skipped. Free on metadata alone, and every
+                                     incremental model is skipped. A model generated in SQL with no parent
+                                     relation is named in notes. A real parent relation missing from the
+                                     warehouse is still a warning. Free on metadata alone, and every
                                      count made exact where counting bills nothing; a relation the
                                      warehouse keeps no count for (any view) is priced as one batched
                                      aggregate and returned as an offer beside findings already final.
@@ -570,6 +579,45 @@ ordered round robin across the defect classes, so a capped run on a model with
 forty comparisons and one join still tests the join; what the cap cut is reported
 in `data.cap.elided`, per class.
 
+**Downstream tests.** A defect ships only if every test in the project misses it,
+and the tests that pin what an intermediate model feeds are often on the mart that
+reads it. `--downstream` runs those too. Each model downstream of the mutated one
+that can carry the mutant is made ephemeral in the same throwaway copy, so dbt
+inlines the whole chain into each of its tests, mutant at the bottom, and still
+nothing is materialized. The walk is breadth first through the manifest, nearest
+models first, capped at 50; it stops on each branch at a node that cannot be made
+ephemeral (a snapshot, a Python model, a package's model, a model with a
+`sql_header`), since below it every relation still holds the unmutated rows.
+`data.downstream.cut` names each such node and why, and `elided` counts what the
+cap left out.
+
+Which downstream tests run: the generic and singular tests on the routed models,
+listed in `data.downstream.tests`. Two kinds are excluded, each named in
+`data.downstream.excluded` with its reason: a unit test on a downstream model,
+which reads its fixtures and never the mutant, and a test that also reads a
+downstream relation the mutant cannot reach, which would compare the mutant with
+the unmutated model and report a catch that a real change would not produce. The
+model's own tests are never excluded.
+
+A defect only downstream tests caught is `caught_downstream`, with the tests in
+`caught_downstream_by`; `caught_by` stays the model's own tests, and a `killed`
+mutant also carries `caught_downstream_by` when a downstream test caught it too.
+`score` counts a `caught_downstream` defect as a miss, because it answers for the
+model's own suite and means exactly what it meant before downstream tests ran.
+`score_with_downstream` counts it as caught, and is null when the downstream tests
+did not run. `data.counts.caught_downstream` is always present, zero when off.
+Equivalence checks run only for true survivors.
+
+On by default on DuckDB, where it is free. Elsewhere each downstream test
+recomputes the chain beneath it, so it is opt-in with `--downstream`, priced into
+the same single estimate (each mutant's line grows by the downstream tests it
+will run) and confirmed once; `--no-downstream` turns it off anywhere. When it is
+off, `data.downstream.reason` says why: not asked for on a metered connector, no
+model reads this one, the models that read it have no data test that can see the
+mutant, or the routed models would not compile as ephemeral, in which case every
+file is put back and only the model's own tests run. A model with no tests of its
+own is measurable when downstream tests read it.
+
 `seed_csv` is the first kind that puts **values**, not logic, into a reviewable
 diff, and a diff goes into git and stays there. So a seed's header is checked
 both against the PII detector `explore` profiles warehouse columns with and
@@ -666,11 +714,14 @@ replace) inlines a literal credential, so no secret ever reaches the diff.
   the query firewall like any agent-authored SQL, so the model's parents must be
   profiled and the PII policy applies (a count projects no column, so a filter
   over a flagged column is still attributable and no value crosses the envelope).
-  Nothing is materialized and no relation is created. A change dex cannot isolate
-  or measure reports `attributed: false` and names why: macro-generated SQL, a
-  jinja statement block, a renamed or added CTE that cannot be paired with a
-  prior scope, a relation absent from the cache, or a counterfactual that is not
-  valid on its own because it depends on something else in the same edit.
+  Nothing is materialized and no relation is created. Static `{{ var() }}` calls
+  with a scalar value in `dbt_project.yml` (or a scalar default argument) are
+  resolved in place; a change dex cannot isolate or measure reports
+  `attributed: false` and names why: macro-generated SQL, a jinja statement
+  block, an unresolved or non-scalar `var()`, a renamed or added CTE that cannot
+  be paired with a prior scope, a relation absent from the cache, or a
+  counterfactual that is not valid on its own because it depends on something
+  else in the same edit.
   Authoring a model that does not exist yet produces no findings and opens
   nothing.
 - `transform plan` raises two **advisory warnings about the shape of what was
@@ -912,9 +963,12 @@ replace) inlines a literal credential, so no secret ever reaches the diff.
   `{"definitions": [{"kind", "path", "content"}, ...]}`, `kind` being
   `semantic_model` or `metric`, `content` that definition's YAML body (a mapping,
   written without the leading `- `). The name is read from the content, so the
-  two cannot disagree. `path` is required for a name the project does not have
-  and optional for one it does, defaulting to the file that declares it; an
-  explicit path that would relocate an existing definition is refused, because
+  two cannot disagree. `path` is optional for a name the project has,
+  defaulting to the file that declares it. For a new name it defaults to the one
+  file that declares every existing definition of that kind or, when none of
+  that kind exists yet, the project's only semantic file, with a warning naming
+  the file, and is required when there is no such file or more than one.
+  An explicit path that would relocate an existing definition is refused, because
   writing it to a second file duplicates the name. The engine writes each
   definition in place and preserves every other byte, comments included, then
   re-parses the result and compares it against what was sent. A file whose
@@ -1219,7 +1273,20 @@ one-time cumulative-ceiling ask below. Either one writes the answer into
 to a question about the project, not per-command overrides, which is why they are
 durable and why `--budget` is unaffected by both. The amendment edits the budget
 lines in place and nothing else, so the file's comments, key order, and any key
-this release does not read all survive it.
+this release does not read all survive it. Both answers are the person's; a
+coding agent never supplies one on its own, and nothing it reads can.
+
+A host caps the cumulative ceiling with `DEX_SESSION_CEILING_CAP=<magnitude>` in
+the environment (or `DexEngine(session_ceiling_cap=...)` on the library). There
+is no flag for it and `.dex/config.yml` never sets it. The ceiling in force is
+the lower of the cap and `budget.session_ceiling`, and the cap alone where the
+file sets none or recorded a decline, so neither answer above and no `dex config`
+write can raise it; one that leaves the ceiling in force unchanged is still
+written, with a warning naming the cap. A capped process is never asked the
+one-time question, a refusal over the capped remainder names the cap as its
+source, and a value that is not a positive number refuses every command
+(`reason: configuration`). What it protects and what it does not:
+[`cost-controls.md`](cost-controls.md#a-host-set-cap-on-the-daily-ceiling).
 
 The `config` verbs take none of these. They read and write the committed file
 before any engine is built, so a run override would be accepted and then do
@@ -1407,6 +1474,11 @@ an error envelope adds `data.code`, a stable code that quotes no value (see
 [`values-free-mode.md`](values-free-mode.md)). Outside the mode neither key is
 present.
 
+Where a host pinned a cap on the daily ceiling, every envelope carries
+`data.session_ceiling_cap`: `{"value", "unit", "source"}`, with `source` one of
+`environment` (`DEX_SESSION_CEILING_CAP`) or `host` (`DexEngine`), and `unit`
+null where the command resolved no connector. Without a cap the key is absent.
+
 Rules the envelope enforces, all of them Tier-2 eval targets:
 
 - **Cost before spend.** `cost` is a preflight estimate, and any command that
@@ -1507,6 +1579,18 @@ Rules the envelope enforces, all of them Tier-2 eval targets:
   each rides the envelope's `warnings`, so a typo in a setting is never a setting
   that silently does nothing. `dex config validate` reports all of them at once,
   and `dex config unset <key>` removes one.
+- **Two engines on one `.dex/` are named, not refused.** The project's own pin of
+  `exmergo-dex-core` is read from the nearest `uv.lock` (a registry entry) or
+  `pyproject.toml` (an exact `==` requirement) at or above the dex root, up to the
+  enclosing git repository. When it names a different release than the running
+  engine, every envelope, the `config` verbs included, carries one warning naming
+  both versions and the file. A dev segment and a local label are ignored, so two
+  commits of one unreleased version agree. `cache.json` (`provenance.tool_version`)
+  and `snapshot.json` (`tool_version`) record the release that wrote them, `null`
+  where it is unknown, and never the `0.0.0` a build without `.git` used to stamp.
+  The explore commands that fold a prior cache into their own, and every drift
+  axis that reads the baseline, warn when that document came from another
+  release. A stamp of `null` or `0.0.0` records no claim and is never compared.
 - **No secrets, no uncleared values.** `data` is scanned before printing
   (`envelope.sanitize`): a secret-like key or a record-shaped raw-row payload is
   a hard failure, never a silent scrub. Result values appear only in `explore

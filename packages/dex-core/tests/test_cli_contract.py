@@ -748,7 +748,8 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
         "reason": (
             "two modes on one verb: --mutate is DexEngine.test_mutations (with "
             "--check-equivalence/--no-check-equivalence collapsing into its "
-            "check_equivalence tri-state, asserted separately), while "
+            "check_equivalence tri-state and --downstream/--no-downstream into "
+            "its downstream tri-state, both asserted separately), while "
             "--scaffold is reachable as "
             "exmergo_dex_core.transform.commands.test_scaffold(engine, scaffold) "
             "and is not a DexEngine method"
@@ -999,6 +1000,38 @@ def test_the_equivalence_flag_pair_reaches_the_engine_as_one_tri_state(
                 "--check-equivalence",
                 "--no-check-equivalence",
             ]
+        )
+
+
+@pytest.mark.parametrize(
+    "flags,expected",
+    [([], None), (["--downstream"], True), (["--no-downstream"], False)],
+)
+def test_the_downstream_flag_pair_reaches_the_engine_as_one_tri_state(
+    flags, expected, monkeypatch
+):
+    """Absent means the connector decides (on where it is free, opt-in where
+    it bills), and either spelling overrides it, through one engine keyword."""
+
+    from exmergo_dex_core.cli import _build_parser
+    from exmergo_dex_core.transform import commands
+
+    args = _build_parser().parse_args(["transform", "test", "--mutate", "fct", *flags])
+    assert args.downstream is expected
+
+    seen: dict = {}
+
+    def capture(engine, model, **kwargs):
+        seen.update(kwargs, model=model)
+        raise ValueError("captured")
+
+    monkeypatch.setattr(commands, "test_mutations", capture)
+    commands.cmd_test(args, engine=None)
+    assert seen["downstream"] is expected
+
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(
+            ["transform", "test", "--mutate", "fct", "--downstream", "--no-downstream"]
         )
 
 

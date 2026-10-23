@@ -109,6 +109,33 @@ def test_over_ceiling_refusal_is_live_and_free(tmp_path: Path, capsys, bq_projec
     assert not (tmp_path / ".dex" / "spend.jsonl").exists()
 
 
+def test_a_host_cap_binds_over_a_generous_budget_live(
+    tmp_path: Path, capsys, monkeypatch, bq_project: str
+):
+    """#787: a declined cumulative ceiling and a generous --budget still meet
+    the host's cap, refused at the dry-run stage with nothing billed."""
+
+    seed_repo(tmp_path, bq_project)
+    monkeypatch.setenv("DEX_SESSION_CEILING_CAP", "1000")
+    rc, envelope = run_cli(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "explore",
+            "profile",
+            "wikipedia",
+            "--confirm",
+            "--budget",
+            "100000000000",
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert "DEX_SESSION_CEILING_CAP=1000" in envelope["errors"][0]
+    assert envelope["data"]["session_ceiling_cap"]["unit"] == "bytes"
+    assert not (tmp_path / ".dex" / "spend.jsonl").exists()
+
+
 def test_firewalled_query_round_trip(tmp_path: Path, capsys, bq_project: str):
     seed_repo(tmp_path, bq_project)
     # The firewall's PII policy is computed from the cache; seed it directly

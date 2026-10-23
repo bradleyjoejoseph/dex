@@ -292,3 +292,153 @@ class TestCommandSurface:
         assert payload["data"]["ancestor"] == "mid"
         assert payload["data"]["plan_id"]
         assert len(payload["data"]["paths"]) == 4
+
+
+class TestScaffoldedAndStarAncestors:
+    """#752: `transform place` follows a final `select * from renamed` into the CTE."""
+
+    def test_scaffolded_ancestor_with_renamed_cte_is_eligible_and_threaded(
+        self, tmp_path: Path
+    ):
+        """Acceptance bullet 1: a scaffolded model ending in `select * from renamed`
+        is recognized as projecting its CTE's columns, placed as common_ancestor,
+        and the edit lands inside the renamed CTE."""
+        root = tmp_path / "shop"
+        _write(
+            root / "dbt_project.yml",
+            'name: shop\nprofile: shop\nversion: "1.0"\nmodel-paths: [models]\n',
+        )
+        _write(
+            root / "models/stg_returns.sql",
+            "with source as (\n"
+            "    select * from {{ source('raw', 'returns') }}\n"
+            "),\n\n"
+            "renamed as (\n"
+            "    select\n"
+            "        order_id,\n"
+            "        return_id\n"
+            "    from source\n"
+            ")\n\n"
+            "select * from renamed\n",
+        )
+        _write(
+            root / "models/fct_returns.sql",
+            "select\n    order_id\nfrom {{ ref('stg_returns') }}\n",
+        )
+        _write(
+            root / "models/dim_returns.sql",
+            "select\n    order_id\nfrom {{ ref('stg_returns') }}\n",
+        )
+        _write(
+            root / "models/schema.yml",
+            "version: 2\nmodels:\n"
+            "  - name: stg_returns\n    columns:\n      - name: order_id\n"
+            "  - name: fct_returns\n    columns:\n      - name: order_id\n"
+            "  - name: dim_returns\n    columns:\n      - name: order_id\n",
+        )
+
+        result = _place(
+            root,
+            "order_ref",
+            ["fct_returns", "dim_returns"],
+            "cast(order_id as varchar)",
+        )
+
+        assert result.strategy == "common_ancestor"
+        assert result.ancestor == "stg_returns"
+        stg_edit = next(e for e in result.edits if e.path.endswith("stg_returns.sql"))
+        assert "cast(order_id as varchar) as order_ref" in stg_edit.new_content
+        # Placed inside renamed CTE before 'from source', preserving trailing
+        # 'select * from renamed'
+        assert "select * from renamed" in stg_edit.new_content
+        assert stg_edit.new_content.index(
+            "cast(order_id as varchar) as order_ref"
+        ) < stg_edit.new_content.index("select * from renamed")
+
+    def test_direct_star_reads_source_or_ref_still_falls_back_with_star_note(
+        self, tmp_path: Path
+    ):
+        """Acceptance bullet 2: a model whose final `select *` reads a ref()/source()
+        directly still gets today's 'projects select *' answer."""
+        root = tmp_path / "shop"
+        _write(
+            root / "dbt_project.yml",
+            'name: shop\nprofile: shop\nversion: "1.0"\nmodel-paths: [models]\n',
+        )
+        _write(
+            root / "models/stg_returns.sql",
+            "select * from {{ source('raw', 'returns') }}\n",
+        )
+        _write(
+            root / "models/fct_returns.sql",
+            "select\n    order_id\nfrom {{ ref('stg_returns') }}\n",
+        )
+        _write(
+            root / "models/dim_returns.sql",
+            "select\n    order_id\nfrom {{ ref('stg_returns') }}\n",
+        )
+        _write(
+            root / "models/schema.yml",
+            "version: 2\nmodels:\n"
+            "  - name: fct_returns\n    columns:\n      - name: order_id\n"
+            "  - name: dim_returns\n    columns:\n      - name: order_id\n",
+        )
+
+        result = _place(
+            root,
+            "order_ref",
+            ["fct_returns", "dim_returns"],
+            "cast(order_id as varchar)",
+        )
+
+        assert result.strategy == "per_target"
+        assert result.ancestor is None
+        reason = " ".join(result.reasoning)
+        assert "projects `select *`" in reason
+        assert "stg_returns" in reason
+
+    def test_joined_ctes_star_still_falls_back_with_star_note(self, tmp_path: Path):
+        """Acceptance bullet 3: a model whose final `select *` reads a join of two
+        CTEs still gets today's answer."""
+        root = tmp_path / "shop"
+        _write(
+            root / "dbt_project.yml",
+            'name: shop\nprofile: shop\nversion: "1.0"\nmodel-paths: [models]\n',
+        )
+        _write(
+            root / "models/stg_returns.sql",
+            "with a as (\n"
+            "    select order_id from {{ source('raw', 'orders') }}\n"
+            "),\n"
+            "b as (\n"
+            "    select order_id from {{ source('raw', 'returns') }}\n"
+            ")\n"
+            "select * from a join b using (order_id)\n",
+        )
+        _write(
+            root / "models/fct_returns.sql",
+            "select\n    order_id\nfrom {{ ref('stg_returns') }}\n",
+        )
+        _write(
+            root / "models/dim_returns.sql",
+            "select\n    order_id\nfrom {{ ref('stg_returns') }}\n",
+        )
+        _write(
+            root / "models/schema.yml",
+            "version: 2\nmodels:\n"
+            "  - name: fct_returns\n    columns:\n      - name: order_id\n"
+            "  - name: dim_returns\n    columns:\n      - name: order_id\n",
+        )
+
+        result = _place(
+            root,
+            "order_ref",
+            ["fct_returns", "dim_returns"],
+            "cast(order_id as varchar)",
+        )
+
+        assert result.strategy == "per_target"
+        assert result.ancestor is None
+        reason = " ".join(result.reasoning)
+        assert "projects `select *`" in reason
+        assert "stg_returns" in reason

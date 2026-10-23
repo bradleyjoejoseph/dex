@@ -481,6 +481,22 @@ The guarantee ships as an executable contract,
 pin. What the mode keeps, withholds and refuses, and the residual risks it does
 not close, are in [`values-free-mode.md`](values-free-mode.md).
 
+## Pinning the daily spend ceiling
+
+A host that confirms spend on an agent's behalf, or lets an agent confirm inside
+committed limits, pins the daily ceiling where it builds the engine:
+`DexEngine(session_ceiling_cap=<magnitude>)`, or `DEX_SESSION_CEILING_CAP` in the
+environment of every CLI process it launches. The ceiling in force is the lower
+of the cap and the repository's `budget.session_ceiling`, so nothing the agent
+writes to `.dex/config.yml`, no answer flag, and no constructor argument raises
+spend above it. Assert on the result rather than trusting the setting:
+`result.session_ceiling_cap` on the library, `data.session_ceiling_cap` on every
+envelope, each carrying the value, the unit and the source. It holds where the
+agent cannot reach the constructor or the environment; against a coding agent
+with an unrestricted shell it needs the agent host's permissions as well, as
+[`cost-controls.md`](cost-controls.md#what-it-protects-and-what-it-does-not)
+sets out.
+
 ## What stays where it is
 
 Every existing public method keeps its signature and its result shape, and

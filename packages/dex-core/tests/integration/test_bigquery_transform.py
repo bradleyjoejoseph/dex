@@ -14,8 +14,10 @@ import yaml
 
 from .conftest import (
     MAX_BYTES,
+    assert_downstream_run,
     assert_ok,
     assert_unpivot_build,
+    downstream_probe_edits,
     integration_budget,
     unpivot_fixture_edits,
 )
@@ -404,3 +406,52 @@ def test_mutation_coverage_prices_the_batch_then_measures_the_tests(
         )
     finally:
         client.close()
+
+
+def test_mutation_downstream_tests_catch_what_the_models_own_miss_live(
+    tmp_path: Path, capsys, bq_project: str, bq_scratch_dataset: str
+):
+    """transform test --mutate --downstream (#648) on BigQuery: opt-in, dry-run
+    priced into the one estimate, and the mart's count test catches the
+    dropped filter. The dev dataset holds the same tables afterwards."""
+
+    pytest.importorskip("dbt.adapters.bigquery")
+    root = str(tmp_path)
+    _seed_transform_repo(tmp_path, bq_project, bq_scratch_dataset)
+    rc, envelope = run_cli(
+        ["--repo-root", root, "transform", "init", "analytics"], capsys
+    )
+    assert_ok(rc, envelope)
+    edits_file = tmp_path / "edits.json"
+    edits_file.write_text(
+        json.dumps(
+            downstream_probe_edits(
+                "select * from unnest([struct(1 as id, 10 as amount), "
+                "struct(2, 200), struct(3, 1)])"
+            )
+        ),
+        encoding="utf-8",
+    )
+    rc, planned = run_cli(
+        [
+            "--repo-root",
+            root,
+            "transform",
+            "plan",
+            "downstream mutation probe",
+            "--edits-file",
+            str(edits_file),
+        ],
+        capsys,
+    )
+    assert rc == 0, planned
+    rc, applied = run_cli(["--repo-root", root, "transform", "apply"], capsys)
+    assert rc == 0, applied
+
+    from google.cloud import bigquery
+
+    client = bigquery.Client(project=bq_project)
+    dataset = f"{bq_project}.{bq_scratch_dataset}"
+    before = {t.table_id for t in client.list_tables(dataset)}
+    assert_downstream_run(run_cli, capsys, root, 4 * MAX_BYTES)
+    assert {t.table_id for t in client.list_tables(dataset)} == before

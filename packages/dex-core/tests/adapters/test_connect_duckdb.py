@@ -120,3 +120,25 @@ def test_list_namespace_objects_lists_one_schema(tmp_path):
     ]
     assert adapter.list_namespace_objects("not_there") == []
     adapter.close()
+
+
+def test_a_host_cap_gates_nothing_on_duckdb(duckdb_file: Path):
+    """#787: DuckDB bills nothing and carries no cost gate, so a host's cap is
+    reported on every result and never applied."""
+
+    from exmergo_dex_core.config import DexConfig
+    from exmergo_dex_core.engine import DexEngine
+
+    engine = DexEngine(
+        connector="duckdb",
+        path=str(duckdb_file),
+        config=DexConfig(connector="duckdb"),
+        session_ceiling_cap=1.0,
+    )
+    result = engine.inventory()
+    assert result.session_ceiling_cap == {
+        "value": 1.0,
+        "unit": None,
+        "source": "host",
+    }
+    assert getattr(engine._adapter(), "cost_gate", None) is None

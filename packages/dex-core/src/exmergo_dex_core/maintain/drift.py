@@ -611,6 +611,10 @@ class GrainPlan(NamedTuple):
     # Joins the semantic layer declares an arity for, each side that arity says
     # is a key re-measured as one. Defaulted for the same reason as above.
     join_cardinality_checks: list[JoinCardinalityCheck] | None = None
+    # Every known join between live relations, verified or not, so a uniqueness
+    # finding names the joins on its key rather than assuming there are some.
+    # Free to collect and never scanned. Defaulted for the same reason as above.
+    joins: list[Relationship] | None = None
 
     def scans(self) -> bool:
         """Whether the plan holds any statement that scans, and so is priced.
@@ -800,6 +804,13 @@ def grain_plan(
         to_columns, _ = describe(rel.to_dataset)
         if rel.from_columns[0] in from_columns and rel.to_columns[0] in to_columns:
             fanout_pairs.append((rel, rel.model_copy(deep=True)))
+    joins = [
+        rel
+        for rel in snap.warehouse.relationships
+        if (scope is None or {rel.from_dataset, rel.to_dataset} & scope)
+        and rel.from_dataset in current
+        and rel.to_dataset in current
+    ]
     unsurveyed = [
         dataset.identifier
         for dataset, _combos, _rows in declared_checks
@@ -848,7 +859,33 @@ def grain_plan(
         notes,
         null_checks,
         cardinality_checks,
+        joins,
     )
+
+
+def _joins_on(
+    plan: GrainPlan, identifier: str, columns: list[str]
+) -> list[dict[str, object]]:
+    """The known joins that match on exactly ``columns`` of ``identifier``, from
+    either side: the joins a lost key would fan out."""
+
+    return [
+        {
+            "from_dataset": rel.from_dataset,
+            "from_columns": rel.from_columns,
+            "to_dataset": rel.to_dataset,
+            "to_columns": rel.to_columns,
+        }
+        for rel in plan.joins or []
+        if (rel.from_dataset == identifier and _same_combo(rel.from_columns, columns))
+        or (rel.to_dataset == identifier and _same_combo(rel.to_columns, columns))
+    ]
+
+
+def _fanout_clause(joins: list[dict[str, object]]) -> str:
+    """Fan-out is stated only where a known join would do it (#779)."""
+
+    return "joins on it will fan out" if joins else "no known join uses it"
 
 
 def _fold_semantic_keys(
@@ -1316,6 +1353,7 @@ def grain_drift(
                 continue
             duplicates = row_count - count
             severity, floor_data, floor_note = _grain_severity(row_count, min_rows)
+            joins = _joins_on(plan, dataset.identifier, [key])
             findings.append(
                 DriftFinding(
                     axis="grain",
@@ -1326,14 +1364,16 @@ def grain_drift(
                     detail=(
                         f"{key} on {dataset.identifier} is no longer unique: "
                         f"{count} distinct over {row_count} rows "
-                        f"(~{duplicates} duplicate rows); joins on it will fan out"
-                        f"{floor_note}"
+                        f"(~{duplicates} duplicate rows); "
+                        + _fanout_clause(joins)
+                        + floor_note
                     ),
                     data={
                         "distinct_count": count,
                         "row_count": row_count,
                         "was_grain": bool(dataset.grain and key in dataset.grain),
                         **floor_data,
+                        **({"joins": joins} if joins else {}),
                     },
                 )
             )
@@ -1355,6 +1395,7 @@ def grain_drift(
             duplicates = row_count - count
             members = ", ".join(combo)
             severity, floor_data, floor_note = _grain_severity(row_count, min_rows)
+            joins = _joins_on(plan, dataset.identifier, combo)
             findings.append(
                 DriftFinding(
                     axis="grain",
@@ -1366,7 +1407,8 @@ def grain_drift(
                         f"({members}) on {dataset.identifier} is no longer "
                         f"unique: {count} distinct combinations over "
                         f"{row_count} rows (~{duplicates} duplicate rows); "
-                        f"joins on it will fan out{floor_note}"
+                        + _fanout_clause(joins)
+                        + floor_note
                     ),
                     data={
                         "columns": list(combo),
@@ -1376,6 +1418,7 @@ def grain_drift(
                             dataset.grain and list(combo) == list(dataset.grain)
                         ),
                         **floor_data,
+                        **({"joins": joins} if joins else {}),
                     },
                 )
             )
@@ -1400,6 +1443,7 @@ def grain_drift(
             duplicates = row_count - count
             members = ", ".join(combo)
             severity, floor_data, floor_note = _grain_severity(row_count, min_rows)
+            joins = _joins_on(plan, dataset.identifier, combo)
             findings.append(
                 DriftFinding(
                     axis="grain",
@@ -1412,8 +1456,10 @@ def grain_drift(
                         f"{dataset.identifier}, and the combination is not "
                         f"unique: {count} distinct combinations over "
                         f"{row_count} rows (~{duplicates} duplicate rows). "
-                        "Builds asserting this grain will fail and joins on it "
-                        f"will fan out{floor_note}"
+                        "Builds asserting this grain will fail"
+                        + (" and " if joins else ", and ")
+                        + _fanout_clause(joins)
+                        + floor_note
                     ),
                     data={
                         "columns": list(combo),
@@ -1421,6 +1467,7 @@ def grain_drift(
                         "row_count": row_count,
                         "declared": True,
                         **floor_data,
+                        **({"joins": joins} if joins else {}),
                     },
                 )
             )

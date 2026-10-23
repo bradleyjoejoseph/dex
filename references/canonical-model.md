@@ -61,13 +61,17 @@ informs proposals, never the source of truth:
                   dataset carries the time it was profiled (profiled_at) so
                   carried-forward profiles stay attributable, and the file carries a
                   schema version, so a profile written before the artifact exclusions
-                  existed is re-profiled rather than read as if they had applied
+                  existed is re-profiled rather than read as if they had applied.
+                  provenance.tool_version is the engine release that last wrote it
+                  (null where unknown), so a cache two releases share says which
+                  one it came from
   snapshot.json   the maintain baseline: a frozen fingerprint of the warehouse schema, the
                   transformation project's state, the semantic layer's definitions with the
                   relationships and keys they declare, and declared grain assumptions. The
                   two project layers are fingerprinted independently, so a repository with a
                   semantic layer and no transformation project still gets a baseline. Written
-                  by `maintain snapshot`; the drift detectors diff current reality against it.
+                  by `maintain snapshot`; the drift detectors diff current reality against it,
+                  and warn when the tool_version it records is another engine release.
   queries.jsonl   the `explore query` audit log: one line per firewall decision (allowed,
                   refused, or failed) with the SQL text and result counts, never result
                   values. A decision that profiled an object on demand first names it

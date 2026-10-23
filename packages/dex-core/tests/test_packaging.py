@@ -1751,3 +1751,43 @@ def test_the_slayer_extra_installs_the_pinned_release_inside_the_dialect_bounds(
 
     assert done.returncode == 0, done.stderr
     assert done.stdout.strip() == "SlayerSemanticLayer"
+
+
+def test_the_bundled_source_builds_at_the_pinned_release(tmp_path: Path):
+    """The installed plugin's engine reports the release it ships, not `0.0.0`.
+
+    A plugin cache is the repository without its `.git`, and the skill launcher
+    builds `packages/dex-core` from there, so hatch-vcs cannot read the tag and
+    reports `fallback_version`. Before #731 that was `0.0.0`, and every cache
+    and baseline the plugin wrote said so. This builds in exactly that layout:
+    the package two levels under a root that has no `.git`.
+    """
+
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_dex_skill_wrapper",
+        PACKAGE_ROOT.parents[1] / "skills" / "explore" / "scripts" / "run.py",
+    )
+    launcher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(launcher)
+
+    bundled = tmp_path / "plugin" / "packages" / "dex-core"
+    shutil.copytree(
+        PACKAGE_ROOT,
+        bundled,
+        ignore=shutil.ignore_patterns(
+            ".venv", "__pycache__", ".pytest_cache", "dist", "tests", "*.egg-info"
+        ),
+    )
+    out = tmp_path / "dist"
+    subprocess.run(  # noqa: S603  (a fixed argv, no shell)
+        [_uv(), "build", "--wheel", "--out-dir", str(out), str(bundled)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    built = [p.name for p in out.glob("*.whl")]
+    assert built and built[0].startswith(
+        f"exmergo_dex_core-{launcher.DEX_CORE_VERSION}-"
+    ), built

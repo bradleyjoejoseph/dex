@@ -7,7 +7,10 @@
 # rewrites that version in all three wrappers so the tagged commit is
 # self-consistent: checking out the tag, or pinning the catalog to it, installs
 # exactly the engine the tag publishes. The connector extra is not part of the pin;
-# the wrapper selects it at runtime, so a release is connector-neutral.
+# the wrapper selects it at runtime, so a release is connector-neutral. It also
+# rewrites hatch-vcs's fallback_version in packages/dex-core/pyproject.toml, which
+# is the version the installed plugin's engine reports: the plugin builds that
+# bundled source from a directory with no .git, where the tag cannot be read.
 #
 # It also builds the release's dated CHANGELOG.md section (the date is today in
 # UTC) from the fragments in changelog.d/, and deletes the fragments it used. The
@@ -93,6 +96,13 @@ for skill in explore transform maintain; do
   rm -f "${f}.bak"
   echo "pinned ${f#"${ROOT}/"} -> ${ENGINE_VERSION}"
 done
+
+f="${ROOT}/packages/dex-core/pyproject.toml"
+sed -i.bak -E \
+  "s/^fallback_version = \"[^\"]*\"/fallback_version = \"${ENGINE_VERSION}\"/" \
+  "$f"
+rm -f "${f}.bak"
+echo "pinned ${f#"${ROOT}/"} fallback_version -> ${ENGINE_VERSION}"
 
 if [ -n "${PLUGIN_VERSION}" ]; then
   for manifest in .claude-plugin/plugin.json .codex-plugin/plugin.json plugin.json gemini-extension.json; do

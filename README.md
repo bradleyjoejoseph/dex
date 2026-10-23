@@ -242,6 +242,11 @@ query by name rather than inventing semantics. See the
 
 **Coming next:** Cube.
 
+## See it on a real project
+
+**[github-repo-analytics](https://github.com/exmergo/github-repo-analytics)** is a template that tracks GitHub traffic, stars, downloads and contributors for your open-source projects, free on GitHub Actions.   
+Every model and metric was built and is maintained with dex. Its audit trail (https://github.com/exmergo/github-repo-analytics/blob/main/.dex/review/README.md) holds the raw envelopes, including the drift Dex blocked and the proposals that were rejected.
+
 ## Use it as a Python library
 
 The engine is a plain Python package, `exmergo-dex-core`:

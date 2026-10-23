@@ -86,6 +86,8 @@ concurrency:
   group: cloud-integration
   cancel-in-progress: false
 
+# Every dbt job selects Python 3.12 explicitly: ubuntu-latest now supplies
+# Python 3.14, which the locked dbt/Mashumaro stack cannot import under.
 jobs:
   bigquery:
     # Forks have a different repository name, so they skip here; a fork can run
@@ -120,6 +122,7 @@ jobs:
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
+          python-version: "3.12"
       # [slayer] runs the governed SLayer query smoke (test_slayer_query.py),
       # which skips itself without it.
       - name: Sync (bigquery + duckdb + slayer + dev extras)
@@ -167,6 +170,7 @@ jobs:
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
+          python-version: "3.12"
       # [slayer] runs the governed SLayer query smoke (test_slayer_query.py),
       # which skips itself without it.
       - name: Sync (snowflake + duckdb + slayer + dev extras)
@@ -278,6 +282,7 @@ jobs:
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
+          python-version: "3.12"
       - name: Sync (databricks + duckdb + dev extras)
         run: uv sync --extra databricks --extra duckdb --extra dev
       - name: Live Databricks integration suite
@@ -317,6 +322,7 @@ jobs:
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
+          python-version: "3.12"
       # [slayer] runs the governed SLayer query smoke (test_slayer_query.py),
       # which skips itself without it.
       - name: Sync (redshift + duckdb + slayer + dev extras)
@@ -399,6 +405,7 @@ jobs:
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
+          python-version: "3.12"
       - name: Sync (postgres + duckdb + slayer + dev extras)
         run: uv sync --extra postgres --extra duckdb --extra slayer --extra dev
       - name: Live Postgres integration suite
@@ -429,6 +436,7 @@ jobs:
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
+          python-version: "3.12"
       - name: Sync (clickhouse + duckdb + dev extras)
         run: uv sync --extra clickhouse --extra duckdb --extra dev
       - name: Live ClickHouse integration suite
@@ -459,6 +467,7 @@ jobs:
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
+          python-version: "3.12"
       - name: Sync (trino + duckdb + dev extras)
         run: uv sync --extra trino --extra duckdb --extra dev
       - name: Live Trino integration suite
@@ -510,6 +519,7 @@ jobs:
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
+          python-version: "3.12"
       - name: Sync (trino + duckdb + dev extras)
         run: uv sync --extra trino --extra duckdb --extra dev
       - name: Live Trino Glue Iceberg suite
@@ -595,6 +605,7 @@ jobs:
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
+          python-version: "3.12"
       - name: Sync (clickhouse + duckdb + dev extras)
         run: uv sync --extra clickhouse --extra duckdb --extra dev
       # The two database credentials are the suite's alone, so they ride on this

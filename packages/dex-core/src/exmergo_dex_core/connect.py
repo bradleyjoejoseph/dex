@@ -326,7 +326,9 @@ def new_cost_gate(
     return CostGate(
         paradigm=paradigm,
         ceiling=budget if budget is not None else config.budget.ceiling,
-        session_ceiling=config.budget.session_ceiling,
+        # The ceiling in force, not the file's: a host's cap (#787) is folded in
+        # here, the one place a gate is built, so every billed command sees it.
+        session_ceiling=config.session_ceiling_in_force,
         session_spent=lambda: store.spend_since(
             utc_day_start(), field=field, connector=connector
         ),
@@ -336,8 +338,9 @@ def new_cost_gate(
         record=store.append_spend_log,
         lock=lock if callable(lock) else None,
         history=(lambda: history(connector=connector)) if callable(history) else None,
-        session_ceiling_declined=config.budget.session_ceiling_declined,
+        session_ceiling_declined=config.session_ceiling_declined_in_force,
         config_path=config.source_path,
+        session_ceiling_cap=config.session_ceiling_cap,
     )
 
 

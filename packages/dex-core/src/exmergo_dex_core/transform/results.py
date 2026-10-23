@@ -351,6 +351,14 @@ class MutationCoverageResult(Result):
     off, carrying the reason, because an absent key would read as "nothing to
     compare". Equivalent survivors stay in ``score``: a fixture can still catch
     them, and leaving them out would flatter the suite.
+
+    ``downstream`` says whether the tests on the models downstream of this one
+    ran against each mutant too, which models carried it, which tests were left
+    out and why, and the reason when the routing was off. A defect only those
+    tests caught is ``caught_downstream``. ``score`` counts it as a miss, since
+    it answers for the model's own suite and must mean what it meant before
+    downstream tests ran; ``score_with_downstream`` counts it as caught, and is
+    null when they did not run.
     """
 
     model: str = ""
@@ -359,9 +367,11 @@ class MutationCoverageResult(Result):
     mutants: list[dict[str, Any]] = Field(default_factory=list)
     counts: dict[str, int] = Field(default_factory=dict)
     score: float | None = None
+    score_with_downstream: float | None = None
     cap: dict[str, Any] = Field(default_factory=dict)
     runs: int = 0
     equivalence: dict[str, Any] | None = None
+    downstream: dict[str, Any] | None = None
 
     def data(self) -> dict[str, Any]:
         return {
@@ -371,9 +381,11 @@ class MutationCoverageResult(Result):
             "mutants": self.mutants,
             "counts": self.counts,
             "score": self.score,
+            "score_with_downstream": self.score_with_downstream,
             "cap": self.cap,
             "runs": self.runs,
             "equivalence": self.equivalence,
+            "downstream": self.downstream,
         }
 
 

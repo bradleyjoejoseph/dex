@@ -836,6 +836,84 @@ def test_plan_guard_refuses_a_delete_that_orphans_a_ref(
     )
 
 
+def test_plan_guard_refuses_a_delete_that_orphans_a_python_ref(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """#657: a surviving dbt.ref() in a Python model blocks deletion."""
+
+    py_path = dbt_project_dir / "models" / "marts" / "py_customers.py"
+    py_path.parent.mkdir(parents=True, exist_ok=True)
+    py_path.write_text(
+        'def model(dbt, session):\n    return dbt.ref("stg_customers")\n',
+        encoding="utf-8",
+    )
+    payload = _write_payload(
+        tmp_path,
+        [
+            {
+                "path": "models/staging/stg_customers.sql",
+                "kind": "model_sql",
+                "op": "delete",
+            }
+        ],
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "drop stg_customers",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 1
+    msg = envelope["errors"][0]
+    assert "stg_customers" in msg and "py_customers" in msg
+
+
+def test_plan_guard_refuses_a_delete_that_orphans_a_yaml_snapshot_relation(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """#657: a surviving snapshot relation: blocks deletion."""
+
+    snap = dbt_project_dir / "snapshots" / "snapshots.yml"
+    snap.parent.mkdir(parents=True, exist_ok=True)
+    snap.write_text(
+        "snapshots:\n"
+        "  - name: customers_snapshot\n"
+        "    relation: ref('stg_customers')\n",
+        encoding="utf-8",
+    )
+    payload = _write_payload(
+        tmp_path,
+        [
+            {
+                "path": "models/staging/stg_customers.sql",
+                "kind": "model_sql",
+                "op": "delete",
+            }
+        ],
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "drop stg_customers",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 1
+    msg = envelope["errors"][0]
+    assert "stg_customers" in msg and "snapshots.yml" in msg
+
+
 def test_plan_accepts_a_delete_plus_the_update_that_removes_the_ref(
     dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
 ):

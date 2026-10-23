@@ -421,6 +421,110 @@ def assert_unpivot_build(built: dict) -> None:
     assert all(s in {"success", "pass"} for s in statuses.values()), statuses
 
 
+#: The downstream probe (#648): an intermediate model with one row its filter
+#: drops, a mart that counts it, and a singular test on the mart only. The
+#: model's own `not_null`/`unique` cannot see the filter go; the mart's count can.
+DOWNSTREAM_PROBE = "dex_mutation_int"
+DOWNSTREAM_MART = "dex_mutation_mart"
+DOWNSTREAM_TEST = "assert_dex_mutation_mart_count"
+
+
+def downstream_probe_edits(rows_sql: str) -> dict:
+    """The probe as an edits payload. ``rows_sql`` is the connector's spelling
+    of a SELECT over the literal rows (1, 10), (2, 200) and (3, 1) as columns
+    ``id`` and ``amount``; the probe keeps the two with ``amount > 5``."""
+
+    return {
+        "edits": [
+            {
+                "path": f"models/staging/{DOWNSTREAM_PROBE}.sql",
+                "kind": "model_sql",
+                "content": (
+                    f"select id, amount from ({rows_sql}) as t where amount > 5\n"  # noqa: S608
+                ),
+            },
+            {
+                "path": f"models/marts/{DOWNSTREAM_MART}.sql",
+                "kind": "model_sql",
+                "content": (
+                    f"select count(*) as n from {{{{ ref('{DOWNSTREAM_PROBE}') }}}}\n"  # noqa: S608
+                ),
+            },
+            {
+                "path": f"tests/{DOWNSTREAM_TEST}.sql",
+                "kind": "test_sql",
+                "content": (
+                    f"select n from {{{{ ref('{DOWNSTREAM_MART}') }}}} where n <> 2\n"  # noqa: S608
+                ),
+            },
+            {
+                "path": "models/staging/schema.yml",
+                "kind": "schema_yml",
+                "content": (
+                    "version: 2\n"
+                    "models:\n"
+                    f"  - name: {DOWNSTREAM_PROBE}\n"
+                    "    columns:\n"
+                    "      - name: id\n"
+                    "        data_tests: [not_null, unique]\n"
+                ),
+            },
+        ]
+    }
+
+
+def assert_downstream_run(run_cli, capsys, root: str, budget: float) -> dict:
+    """The live acceptance for #648, shared by every metered connector.
+
+    Unasked, the downstream tests are off and say why; asked, they are priced
+    into the one estimate (the baseline line grows by the mart's test), and
+    the confirmed run reports the dropped filter as `caught_downstream`, with
+    the model's own score still counting it as a miss. Returns the routed
+    run's data for any connector-specific checks."""
+
+    mutate = ["--repo-root", root, "transform", "test", "--mutate", DOWNSTREAM_PROBE]
+    rc, unasked = run_cli(mutate, capsys)
+    assert unasked["status"] == "needs_confirmation", unasked
+    rc, asked = run_cli([*mutate, "--downstream"], capsys)
+    assert asked["status"] == "needs_confirmation", asked
+    lines_key = next(k for k in asked["data"] if k.startswith("per_table_"))
+    assert (
+        asked["data"][lines_key]["(baseline)"]
+        > unasked["data"][lines_key]["(baseline)"]
+    ), (unasked["data"], asked["data"])
+    assert asked["cost"]["estimate"] > unasked["cost"]["estimate"]
+
+    rc, alone = run_cli(
+        [*mutate, "--max-mutants", "1", "--confirm", "--budget", str(budget)], capsys
+    )
+    assert rc == 0, alone
+    off = alone["data"]["downstream"]
+    assert off["enabled"] is False and "--downstream" in off["reason"], off
+    assert alone["data"]["score_with_downstream"] is None
+
+    rc, routed = run_cli(
+        [*mutate, "--downstream", "--confirm", "--budget", str(budget)], capsys
+    )
+    assert rc == 0, routed
+    data = routed["data"]
+    assert data["downstream"]["enabled"] is True, data["downstream"]
+    assert data["downstream"]["models"] == [DOWNSTREAM_MART], data["downstream"]
+    assert data["downstream"]["tests"] == [DOWNSTREAM_TEST], data["downstream"]
+    by_operator = {m["operator"]: m for m in data["mutants"]}
+    drop = by_operator["predicate_drop"]
+    assert drop["status"] == "caught_downstream", drop
+    assert drop["caught_downstream_by"] == [DOWNSTREAM_TEST]
+    # No amount sits on the boundary at 5, so nothing anywhere sees the flip.
+    assert by_operator["comparison"]["status"] == "survived"
+    counts = data["counts"]
+    decided = counts["killed"] + counts["caught_downstream"] + counts["survived"]
+    assert data["score"] == counts["killed"] / decided
+    assert data["score_with_downstream"] == (
+        (counts["killed"] + counts["caught_downstream"]) / decided
+    )
+    return data
+
+
 @pytest.fixture
 def ch_dsn() -> str:
     return os.environ["DEX_TEST_CH_DSN"]

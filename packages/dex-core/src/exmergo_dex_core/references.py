@@ -40,6 +40,7 @@ from pydantic import BaseModel, Field
 from .dbt_project import (
     DbtProjectView,
     JinjaCall,
+    _project_vars,
     jinja_calls,
     jinja_regions,
     metric_inputs,
@@ -419,20 +420,35 @@ class ReferenceIndex:
                 self._scan_sql(source.content, path, node_kinds, package=package)
             elif family == "seed" and path.endswith(".csv"):
                 self._scan_seed_header(source.content, path, package=package)
-        # The loader reads SQL only, so a Python model's name comes from the
-        # file on disk. `dbt.ref` and `dbt.source` in that file are reads of
-        # other nodes and are indexed here. The model itself stays a
+        # The loader reads SQL only, so a Python model's name usually comes
+        # from the file on disk. `dbt.ref` and `dbt.source` in that file are
+        # reads of other nodes and are indexed here. The model itself stays a
         # declaration, because dex does not edit `.py`.
+        #
+        # Rename/remove guards overlay edits into ``view.files``, including
+        # Python paths they deleted or rewrote. When the view carries any
+        # ``.py`` entry, that set is authoritative so an in-memory plan is not
+        # contradicted by the on-disk file the plan has not applied yet.
         root = Path(view.root)
-        for model_path in view.model_paths:
-            for python in sorted((root / model_path).rglob("*.py")):
-                self._scan_python_model(
-                    python,
-                    root=root,
-                    prefix=prefix,
+        overlay_python = sorted(path for path in view.files if path.endswith(".py"))
+        if overlay_python:
+            for raw_path in overlay_python:
+                self._scan_python_model_content(
+                    view.files[raw_path].content,
+                    path=f"{prefix}{raw_path}",
                     package=package,
                     node_kinds=node_kinds,
                 )
+        else:
+            for model_path in view.model_paths:
+                for python in sorted((root / model_path).rglob("*.py")):
+                    self._scan_python_model(
+                        python,
+                        root=root,
+                        prefix=prefix,
+                        package=package,
+                        node_kinds=node_kinds,
+                    )
         self._scan_yaml(
             view, node_kinds, documents=documents, package=package, prefix=prefix
         )
@@ -453,24 +469,47 @@ class ReferenceIndex:
         node_kinds: dict[str, str],
     ) -> None:
         path = f"{prefix}{python.relative_to(root).as_posix()}"
-        self._declared[("model", python.stem)].append(
-            Reference(
-                path=path,
-                line=1,
-                form="python_model",
-                kind="model",
-                name=python.stem,
-                package=package,
-            )
-        )
         try:
             content = python.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
+            self._declared[("model", python.stem)].append(
+                Reference(
+                    path=path,
+                    line=1,
+                    form="python_model",
+                    kind="model",
+                    name=python.stem,
+                    package=package,
+                )
+            )
             self._python_unread.append(
                 f"{path}: the Python model could not be read, so its ref() and "
                 "source() calls were not read"
             )
             return
+        self._scan_python_model_content(
+            content, path=path, package=package, node_kinds=node_kinds
+        )
+
+    def _scan_python_model_content(
+        self,
+        content: str,
+        *,
+        path: str,
+        package: str | None,
+        node_kinds: dict[str, str],
+    ) -> None:
+        stem = node_name(path)
+        self._declared[("model", stem)].append(
+            Reference(
+                path=path,
+                line=1,
+                form="python_model",
+                kind="model",
+                name=stem,
+                package=package,
+            )
+        )
         calls = _python_relation_calls(content)
         if calls is None:
             self._python_unread.append(
@@ -1451,6 +1490,31 @@ def _column_names(key: str, value: Any) -> list[str]:
     if isinstance(value, list):
         return [item for item in value if isinstance(item, str)]
     return []
+
+
+def project_vars(view: DbtProjectView) -> dict[str, Any]:
+    """Static ``vars:`` declared in ``dbt_project.yml`` for ``view``.
+
+    Uses the mapping :func:`~..dbt_project.load` already parsed when present,
+    falling back to ``view.files['dbt_project.yml']`` only for hand-built views.
+    """
+
+    if view.vars:
+        return dict(view.vars)
+    source = view.files.get("dbt_project.yml")
+    if source is None:
+        return {}
+    try:
+        parsed = yaml.safe_load(source.content)
+    except yaml.YAMLError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    project_name = parsed.get("name")
+    return _project_vars(
+        parsed,
+        project_name if isinstance(project_name, str) else view.project_name,
+    )
 
 
 def _var_names(parsed: dict[str, Any]) -> list[str]:

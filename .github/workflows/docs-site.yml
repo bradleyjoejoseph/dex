@@ -60,6 +60,7 @@ on:
       - references/**
       - CHANGELOG.md
       - scripts/build_docs_site.py
+      - scripts/build_docs_backfill.py
       - scripts/check_no_em_dashes.py
       - packages/dex-core/src/exmergo_dex_core/cli.py
       - packages/dex-core/src/exmergo_dex_core/config.py
@@ -146,13 +147,71 @@ jobs:
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
+      # The version switcher: the KEEP_VERSIONS minor releases before the one
+      # being built, none older than OLDEST_VERSION, stay readable at
+      # /dex/vX.Y/; the oldest drops off as a new minor ships. Each is rebuilt
+      # here from the newest patch tag of its minor, so it shows what was
+      # published for it and nothing is kept between runs.
+      #   - A tag with its own build_docs_site.py is built by that script.
+      #   - A tag from before the site (v1.12, v1.13) is built by the first
+      #     site's script, BACKFILL_SCRIPT_TAG's, over its own references,
+      #     changelog and CLI; scripts/build_docs_backfill.py says what that
+      #     relaxes.
+      # The whole step is skipped when the ref being built has a script without
+      # --archive (a rollback to before versions existed).
+      - name: Build the previous minor releases
+        id: archives
+        env:
+          OLDEST_VERSION: v1.12
+          KEEP_VERSIONS: 4
+          BACKFILL_SCRIPT_TAG: v1.14.1
+        run: |
+          set -euo pipefail
+          args=""
+          if grep -q -- '"--archive"' scripts/build_docs_site.py; then
+            finals=$(git tag --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V)
+            current=$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null \
+              || echo "$finals" | tail -n 1)
+            latest=$(echo "$current" | sed -E 's/^(v[0-9]+\.[0-9]+)\..*/\1/')
+            # Minors below the one being built, newest first, down to the oldest kept.
+            minors=$(echo "$finals" | sed -E 's/^(v[0-9]+\.[0-9]+)\..*/\1/' | uniq \
+              | awk -v cut="$latest" '$0 == cut { exit } { print }' \
+              | awk -v floor="$OLDEST_VERSION" 'keep || $0 == floor { keep = 1; print }' \
+              | tac | head -n "$KEEP_VERSIONS")
+            backfill="$GITHUB_WORKSPACE/scripts/build_docs_backfill.py"
+            for minor in $minors; do
+              tag=$(echo "$finals" | grep -E "^${minor//./\\.}\." | tail -n 1)
+              src="$RUNNER_TEMP/src-${minor}"
+              out="$RUNNER_TEMP/archive-${minor}"
+              git worktree add --quiet --detach "$src" "$tag"
+              if git cat-file -e "${tag}:scripts/build_docs_site.py" 2>/dev/null; then
+                (cd "$src" && uv run --project packages/dex-core python scripts/build_docs_site.py \
+                  --out "$out" --release "$tag")
+              elif [ -f "$backfill" ]; then
+                git -C "$src" checkout --quiet "$BACKFILL_SCRIPT_TAG" -- \
+                  docs scripts/build_docs_site.py scripts/check_no_em_dashes.py
+                (cd "$src" && uv run --project packages/dex-core python "$backfill" \
+                  --out "$out" --release "$tag")
+              else
+                echo "${tag} predates the docs site and this ref cannot backfill it."
+                continue
+              fi
+              args="${args} --archive ${tag}=${out}/dex"
+            done
+            args="--latest ${current}${args}"
+          fi
+          echo "args=${args}" >> "$GITHUB_OUTPUT"
       - name: Build the Dex section into the shared site
         env:
           RELEASE: ${{ steps.decide.outputs.release }}
+          ARCHIVES: ${{ steps.archives.outputs.args }}
         run: |
+          # ARCHIVES is built above from tag names and runner paths only, and is
+          # split into words on purpose.
+          # shellcheck disable=SC2086
           uv run --project packages/dex-core python scripts/build_docs_site.py \
             --out "$RUNNER_TEMP/site" --site exmergo-docs --require-help \
-            ${RELEASE:+--release "$RELEASE"}
+            ${RELEASE:+--release "$RELEASE"} $ARCHIVES
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"

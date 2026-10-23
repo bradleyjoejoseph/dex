@@ -43,6 +43,11 @@ jobs:
               fail=1
             fi
           done
+          if ! grep -qxF "fallback_version = \"${VERSION}\"" packages/dex-core/pyproject.toml; then
+            echo "packages/dex-core/pyproject.toml fallback_version is not ${VERSION}:"
+            grep -n "fallback_version" packages/dex-core/pyproject.toml || true
+            fail=1
+          fi
           if ! grep -qF "## [${VERSION}] - " CHANGELOG.md; then
             echo "CHANGELOG.md has no ${VERSION} section."
             fail=1

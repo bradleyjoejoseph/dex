@@ -89,6 +89,16 @@ FRAGMENTS = {
 WRAPPERS = [
     f"skills/{skill}/scripts/run.py" for skill in ("explore", "transform", "maintain")
 ]
+#: The engine's own pyproject, whose hatch-vcs fallback is the version the
+#: installed plugin's engine reports (#731), so the release couples it too. Only
+#: the lines the script rewrites are written, the comment and the key around it.
+ENGINE_PYPROJECT = "packages/dex-core/pyproject.toml"
+ENGINE_PYPROJECT_TEXT = (
+    "[tool.hatch.version.raw-options]\n"
+    'root = "../.."\n'
+    '# fallback_version = "keep me" is a comment, not the key\n'
+    'fallback_version = "{version}"\n'
+)
 MANIFESTS = [
     ".claude-plugin/plugin.json",
     ".codex-plugin/plugin.json",
@@ -126,6 +136,11 @@ def release_repo(tmp_path: Path) -> Path:
         path = repo / wrapper
         path.parent.mkdir(parents=True)
         path.write_text('DEX_CORE_VERSION = "1.0.1"\n', encoding="utf-8")
+    engine_pyproject = repo / ENGINE_PYPROJECT
+    engine_pyproject.parent.mkdir(parents=True)
+    engine_pyproject.write_text(
+        ENGINE_PYPROJECT_TEXT.format(version="1.0.1"), encoding="utf-8"
+    )
     for manifest in MANIFESTS:
         path = repo / manifest
         path.parent.mkdir(exist_ok=True)
@@ -227,6 +242,11 @@ def test_a_release_deletes_what_it_consumed_and_stages_nothing(release_repo):
     for wrapper in WRAPPERS:
         text = (release_repo / wrapper).read_text(encoding="utf-8")
         assert text == 'DEX_CORE_VERSION = "9.9.9"\n'
+    # The plugin builds its bundled engine with no .git, so this fallback is the
+    # version every `.dex/` stamp it writes carries; it moves with the pin.
+    assert (release_repo / ENGINE_PYPROJECT).read_text(
+        encoding="utf-8"
+    ) == ENGINE_PYPROJECT_TEXT.format(version="9.9.9")
     for manifest in MANIFESTS:
         loaded = json.loads((release_repo / manifest).read_text(encoding="utf-8"))
         assert loaded["version"] == "9.9.9-rc.1"

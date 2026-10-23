@@ -460,26 +460,24 @@ def relation_verdict(name: str, live: list[str]) -> str | None:
 
 
 def tool_version() -> str | None:
-    """The installed engine version, for stamping into cache provenance.
+    """The running engine's version, for stamping into cache provenance.
 
-    Falls back to the in-tree ``__version__`` when package metadata is not
-    available, e.g. an editable or source checkout that was never installed.
+    None when it is unknown, never the `0.0.0` a source build without `.git` once
+    reported: a stamp is read back to compare engines (#731), and a placeholder
+    would compare as a release. See `engine_version.running_version`.
     """
 
-    try:
-        from importlib.metadata import version
+    from .engine_version import running_version
 
-        return version("exmergo-dex-core")
-    except Exception:
-        from . import __version__
-
-        return __version__
+    return running_version()
 
 
 class CacheProvenance(BaseModel):
     connector: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
+    #: The engine that last wrote this cache, re-stamped on every save (see
+    #: `ExploreStore.save_cache`), so it is never the engine that first made it.
     tool_version: str | None = Field(default_factory=tool_version)
     #: Namespaces whose complete object inventory contributed to this cache.
     #: A named relation absent from one of these namespaces is known missing;

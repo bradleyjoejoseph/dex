@@ -391,6 +391,59 @@ class TestNodeRename:
 
 
 class TestRemoval:
+    @pytest.mark.parametrize("column", ["order_id", "amount"])
+    def test_remove_scaffolded_column_edits_its_cte_projection(
+        self, project: Path, column: str
+    ):
+        original = (
+            "with renamed as (\n"
+            "    select\n"
+            "        order_id,\n"
+            "        customer_id,\n"
+            "        amount\n"
+            "    from {{ source('raw', 'orders') }}\n"
+            ")\n"
+            "select * from renamed\n"
+        )
+        _write(project / "models/staging/stg_orders.sql", original)
+        schema_path = project / "models/staging/schema.yml"
+        _write(schema_path, schema_path.read_text() + "      - name: amount\n")
+        for name in ("int_orders", "mart_a", "mart_b"):
+            _write(
+                project / f"models/marts/{name}.sql",
+                "select customer_id from {{ ref('stg_orders') }}\n",
+            )
+
+        result = _propagate(project, "column", f"stg_orders.{column}")
+        sql = next(e for e in result.edits if e.path.endswith("stg_orders.sql"))
+        assert sql.new_content is not None
+        if column == "order_id":
+            expected = original.replace("        order_id,\n", "")
+        else:
+            expected = original.replace(
+                "        customer_id,\n        amount\n", "        customer_id\n"
+            )
+        assert sql.new_content == expected
+        assert not any("carries the column through" in note for note in result.notes)
+        schema = next(e for e in result.edits if e.path.endswith("schema.yml"))
+        assert schema.new_content is not None
+        assert f"- name: {column}" not in schema.new_content
+
+    def test_remove_scaffolded_column_refuses_other_reads(self, project: Path):
+        _write(
+            project / "models/staging/stg_orders.sql",
+            "with renamed as (\n"
+            "    select order_id, customer_id, amount\n"
+            "    from {{ source('raw', 'orders') }}\n"
+            ")\n"
+            "select * from renamed where order_id > 0\n",
+        )
+        with pytest.raises(
+            PropagationRefusedError, match="read by hand-written logic"
+        ) as exc:
+            _propagate(project, "column", "stg_orders.order_id")
+        assert "where clause" in str(exc.value)
+
     def test_a_surviving_read_refuses_and_names_it(self, project: Path):
         """dex removes a declaration and will not invent what a read becomes.
 
@@ -544,3 +597,116 @@ class TestCommandSurface:
         assert rc != 0
         assert payload["status"] == "error"
         assert "stg_orders.order_id" in json.dumps(payload["errors"])
+
+
+class TestPythonAndYamlSnapshotReaders:
+    """Regression for #657: rename/remove honor readers references already finds."""
+
+    def test_rename_rewrites_a_yaml_snapshot_relation(self, project: Path):
+        _write(
+            project / "snapshots/snapshots.yml",
+            "snapshots:\n  - name: orders_snapshot\n    relation: ref('stg_orders')\n",
+        )
+
+        result = _propagate(project, "model", "stg_orders", "stg_order_events")
+
+        yml = next(e for e in result.edits if e.path == "snapshots/snapshots.yml")
+        assert "ref('stg_order_events')" in yml.new_content
+        assert "ref('stg_orders')" not in yml.new_content
+        assert result.sites.get("yaml_snapshot_relation") == 1
+
+    def test_remove_refuses_a_surviving_yaml_snapshot_relation(self, project: Path):
+        _write(project / "models/staging/stg_isolated.sql", "select 1 as id\n")
+        _write(
+            project / "snapshots/snapshots.yml",
+            "snapshots:\n"
+            "  - name: isolated_snapshot\n"
+            "    relation: ref('stg_isolated')\n",
+        )
+
+        with pytest.raises(PropagationRefusedError) as exc:
+            _propagate(project, "model", "stg_isolated")
+
+        assert "snapshots/snapshots.yml" in str(exc.value)
+        assert "read(s) behind" in str(exc.value)
+
+    def test_remove_accepts_when_the_yaml_snapshot_reader_is_edited_away(
+        self, project: Path
+    ):
+        _write(project / "models/staging/stg_isolated.sql", "select 1 as id\n")
+        _write(
+            project / "snapshots/snapshots.yml",
+            "snapshots:\n"
+            "  - name: isolated_snapshot\n"
+            "    relation: ref('stg_isolated')\n",
+        )
+
+        result = _propagate(
+            project,
+            "model",
+            "stg_isolated",
+            extra_edits=[
+                PlanEdit(
+                    path="snapshots/snapshots.yml",
+                    new_content="snapshots:\n"
+                    "  - name: isolated_snapshot\n"
+                    "    relation: ref('stg_orders')\n",
+                    kind=EditKind.SCHEMA_YML,
+                )
+            ],
+        )
+
+        paths = {edit.path for edit in result.edits}
+        assert "models/staging/stg_isolated.sql" in paths
+        assert "snapshots/snapshots.yml" in paths
+
+    def test_rename_refuses_a_surviving_python_ref(self, project: Path):
+        _write(
+            project / "models/marts/py_orders.py",
+            'def model(dbt, session):\n    return dbt.ref("stg_orders")\n',
+        )
+
+        with pytest.raises(PropagationRefusedError) as exc:
+            _propagate(project, "model", "stg_orders", "stg_order_events")
+
+        assert "py_orders.py" in str(exc.value)
+        assert "Python reader" in str(exc.value)
+
+    def test_rename_accepts_when_the_python_reader_is_updated(self, project: Path):
+        _write(
+            project / "models/marts/py_orders.py",
+            'def model(dbt, session):\n    return dbt.ref("stg_orders")\n',
+        )
+
+        result = _propagate(
+            project,
+            "model",
+            "stg_orders",
+            "stg_order_events",
+            extra_edits=[
+                PlanEdit(
+                    path="models/marts/py_orders.py",
+                    new_content="def model(dbt, session):\n"
+                    '    return dbt.ref("stg_order_events")\n',
+                    kind=EditKind.MODEL_SQL,
+                )
+            ],
+        )
+
+        paths = {edit.path for edit in result.edits}
+        assert "models/marts/py_orders.py" in paths
+        assert ("models/staging/stg_orders.sql", EditOp.DELETE) in {
+            (e.path, e.op) for e in result.edits
+        }
+
+    def test_remove_refuses_a_surviving_python_ref(self, project: Path):
+        _write(project / "models/staging/stg_isolated.sql", "select 1 as id\n")
+        _write(
+            project / "models/marts/py_isolated.py",
+            'def model(dbt, session):\n    return dbt.ref("stg_isolated")\n',
+        )
+
+        with pytest.raises(PropagationRefusedError) as exc:
+            _propagate(project, "model", "stg_isolated")
+
+        assert "py_isolated.py" in str(exc.value)

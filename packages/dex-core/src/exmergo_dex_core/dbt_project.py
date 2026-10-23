@@ -150,6 +150,7 @@ class DbtProjectView(BaseModel):
     analysis_paths: list[str] = Field(default_factory=lambda: ["analyses"])
     files: dict[str, SourceFile] = Field(default_factory=dict)
     manifest: dict[str, Any] | None = None
+    vars: dict[str, Any] = Field(default_factory=dict)
 
     def path_families(self) -> list[tuple[str, list[str]]]:
         """Every authored path family, as ``(name, configured paths)``.
@@ -327,7 +328,27 @@ def load(project_dir: Path | str = ".") -> DbtProjectView:
         analysis_paths=analysis_paths,
         files=files,
         manifest=manifest,
+        vars=_project_vars(raw, str(project_name)),
     )
+
+
+def _project_vars(raw: dict[str, Any], project_name: str) -> dict[str, Any]:
+    """Static ``vars:`` declared in ``dbt_project.yml`` for ``project_name``.
+
+    Reads the root ``vars:`` mapping and overlays any sub-mapping scoped to the
+    project's own package name, matching dbt's precedence between global and
+    package-scoped project variables.
+    """
+
+    declared = raw.get("vars")
+    if not isinstance(declared, dict):
+        return {}
+    resolved = {str(key): value for key, value in declared.items()}
+    scoped = declared.get(project_name)
+    if isinstance(scoped, dict):
+        for key, value in scoped.items():
+            resolved[str(key)] = value
+    return resolved
 
 
 def resolve_target(project_dir: Path | str, target: str | None = None) -> TargetInfo:

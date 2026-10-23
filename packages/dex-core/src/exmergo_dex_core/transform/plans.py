@@ -677,7 +677,14 @@ def apply(
 #: soft warning it has always been rather than becoming a refusal a caller cannot
 #: see the reason for.
 _BREAKS_ON_DELETE = frozenset(
-    {"ref_call", "semantic_model_ref", "yaml_relationship_to"}
+    {
+        "ref_call",
+        "semantic_model_ref",
+        "yaml_relationship_to",
+        "python_ref",
+        "python_source",
+        "yaml_snapshot_relation",
+    }
 )
 
 
@@ -726,11 +733,22 @@ def validate_deletions(view: DbtProjectView, edits: list[PlanEdit]) -> list[str]
     if not deleted_models:
         return []
 
-    surviving: dict[str, str] = {
-        path: source.content
-        for path, source in view.files.items()
-        if path not in delete_paths
-    }
+    surviving: dict[str, str] = {}
+    root = Path(view.root)
+    for model_path in view.model_paths:
+        base = root / model_path
+        if base.is_dir():
+            for python in base.rglob("*.py"):
+                rel = python.relative_to(root).as_posix()
+                if rel in delete_paths:
+                    continue
+                try:
+                    surviving[rel] = python.read_text(encoding="utf-8")
+                except (OSError, UnicodeError):
+                    continue
+    for path, source in view.files.items():
+        if path not in delete_paths:
+            surviving[path] = source.content
     for edit in edits:
         if edit.op is EditOp.UPSERT and edit.new_content is not None:
             surviving[edit.path] = edit.new_content

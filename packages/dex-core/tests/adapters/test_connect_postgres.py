@@ -980,3 +980,50 @@ def test_a_committed_entry_that_names_nothing_is_still_refused(fake_pg_connectio
     adapter.read_dev_target("dbt_dev")
     with pytest.raises(PostgresConnectionError, match=r"postgres\.schemas"):
         adapter.list_objects()
+
+
+def _capped_gate(cap: float, *, ceiling: float = 600.0, session_ceiling=None):
+    """The gate a capped process builds for Postgres (#787): committed limits
+    from the file, the host's cap folded in where every gate is built."""
+
+    from exmergo_dex_core.config import Budget, DexConfig
+    from exmergo_dex_core.connect import new_cost_gate
+    from exmergo_dex_core.session_cap import SessionCeilingCap
+    from exmergo_dex_core.storage import MemoryStore
+
+    config = DexConfig(
+        connector="postgres",
+        budget=Budget(ceiling=ceiling, session_ceiling=session_ceiling),
+    ).with_session_ceiling_cap(SessionCeilingCap(cap, "environment"))
+    return new_cost_gate(
+        "postgres", config, MemoryStore(), confirmed=True, command="explore query"
+    )
+
+
+def test_a_host_cap_binds_over_a_higher_committed_session_ceiling(fake_pg_connection):
+    adapter = make_adapter(fake_pg_connection)
+    adapter.cost_gate = _capped_gate(0.5, session_ceiling=1_000_000.0)
+    with pytest.raises(OverCeilingError, match=r"DEX_SESSION_CEILING_CAP=0\.5"):
+        adapter.run_query(
+            "SELECT count(*) FROM dexdb.shop.customers",
+            max_rows=10,
+            timeout_seconds=30.0,
+        )
+    assert fake_pg_connection.data_statements == []
+
+
+def test_a_host_cap_inside_the_estimate_lets_the_statement_run_capped(
+    fake_pg_connection,
+):
+    adapter = make_adapter(fake_pg_connection)
+    adapter.cost_gate = _capped_gate(120.0)
+    adapter.run_query(
+        "SELECT count(*) FROM dexdb.shop.customers",
+        max_rows=10,
+        timeout_seconds=30.0,
+    )
+    (statement,) = fake_pg_connection.data_statements
+    # The server-side statement timeout derives from the capped remainder, never
+    # from the higher per-command ceiling.
+    assert statement.session_timeout_ms is not None
+    assert statement.session_timeout_ms <= 120_000

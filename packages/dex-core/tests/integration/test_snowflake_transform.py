@@ -16,8 +16,10 @@ import yaml
 
 from .conftest import (
     SF_MAX_SECONDS,
+    assert_downstream_run,
     assert_ok,
     assert_unpivot_build,
+    downstream_probe_edits,
     unpivot_fixture_edits,
 )
 from .test_snowflake_connect import run_cli, seed_repo
@@ -523,4 +525,66 @@ def test_mutation_coverage_prices_in_seconds_and_materializes_nothing(
         cursor.execute(
             f'DROP VIEW IF EXISTS "{sf_scratch_database}"."DBT_DEV"."{model.upper()}"'
         )
+        conn.close()
+
+
+def test_mutation_downstream_tests_catch_what_the_models_own_miss_live(
+    tmp_path: Path, capsys, sf_scratch_database, sf_warehouse, sf_connection_name
+):
+    """transform test --mutate --downstream (#648) on Snowflake: opt-in, priced
+    in warehouse-seconds into the one estimate, and the mart's count test
+    catches the dropped filter. The dev schema gains no object."""
+
+    root = str(tmp_path)
+    seed_repo(tmp_path, sf_scratch_database, sf_warehouse, sf_connection_name)
+    rc, envelope = run_cli(
+        ["--repo-root", root, "transform", "init", "analytics"], capsys
+    )
+    assert_ok(rc, envelope)
+    edits_file = tmp_path / "edits.json"
+    edits_file.write_text(
+        json.dumps(
+            downstream_probe_edits(
+                "select column1 as id, column2 as amount "
+                "from values (1, 10), (2, 200), (3, 1)"
+            )
+        ),
+        encoding="utf-8",
+    )
+    rc, planned = run_cli(
+        [
+            "--repo-root",
+            root,
+            "transform",
+            "plan",
+            "downstream mutation probe",
+            "--edits-file",
+            str(edits_file),
+        ],
+        capsys,
+    )
+    assert rc == 0, planned
+    rc, applied = run_cli(["--repo-root", root, "transform", "apply"], capsys)
+    assert rc == 0, applied
+
+    import snowflake.connector
+
+    from exmergo_dex_core.config import SnowflakeTarget
+    from exmergo_dex_core.connect import resolve_snowflake_connection
+
+    params, _method = resolve_snowflake_connection(
+        SnowflakeTarget(connection_name=sf_connection_name), os.environ, tmp_path
+    )
+    conn = snowflake.connector.connect(**params)
+
+    def objects() -> set:
+        cursor = conn.cursor()
+        cursor.execute(f'SHOW OBJECTS IN DATABASE "{sf_scratch_database}"')
+        return {(row[4], row[1]) for row in cursor.fetchall()}
+
+    try:
+        before = objects()
+        assert_downstream_run(run_cli, capsys, root, SF_MAX_SECONDS * 10)
+        assert objects() == before
+    finally:
         conn.close()

@@ -16,6 +16,7 @@ import yaml
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
 from .errors import ConfigurationError
+from .session_cap import SessionCeilingCap, ceiling_in_force, ceiling_source
 from .storage import DEX_DIR
 
 CONFIG_FILE = "config.yml"
@@ -1075,6 +1076,11 @@ class DexConfig(BaseModel):
     # `load_config` beside the path, since only a config read from a file can
     # have said anything wrong.
     _load_warnings: list[str] = PrivateAttr(default_factory=list)
+    # A host's cap on the daily ceiling (#787), set by the engine from its
+    # constructor or the environment and never parsed from the file. Private for
+    # the reason `_source_path` is: it never joins a dump, so it can never be
+    # written into a file an agent may edit.
+    _session_ceiling_cap: SessionCeilingCap | None = PrivateAttr(default=None)
 
     @property
     def source_path(self) -> Path | None:
@@ -1087,6 +1093,43 @@ class DexConfig(BaseModel):
         """Problems the file has that every command reports and none refuses."""
 
         return list(self._load_warnings)
+
+    @property
+    def session_ceiling_cap(self) -> SessionCeilingCap | None:
+        """The host's cap on the daily ceiling, or None when no host set one."""
+
+        return self._session_ceiling_cap
+
+    def with_session_ceiling_cap(self, cap: SessionCeilingCap | None) -> DexConfig:
+        """A copy of this config carrying ``cap``, so a host's own config object
+        is never amended by the engine it was handed to."""
+
+        capped = self.model_copy()
+        capped._session_ceiling_cap = cap
+        return capped
+
+    @property
+    def session_ceiling_in_force(self) -> float | None:
+        """The daily ceiling that binds: ``budget.session_ceiling``, the host's
+        cap, or the lower of the two. What every reader of the daily bound reads,
+        so no write to the file can lift spend above a cap (#787)."""
+
+        return ceiling_in_force(self.budget.session_ceiling, self._session_ceiling_cap)
+
+    @property
+    def session_ceiling_declined_in_force(self) -> bool:
+        """Whether the day runs unbounded by a recorded choice. A cap overrides a
+        decline: the day is bounded, so nothing should say it is not."""
+
+        declined = self.budget.session_ceiling_declined
+        return declined and self._session_ceiling_cap is None
+
+    @property
+    def session_ceiling_source(self) -> str:
+        """``config``, ``environment`` or ``host``: whichever set the ceiling in
+        force, so a refusal can name the one place it can be raised."""
+
+        return ceiling_source(self.budget.session_ceiling, self._session_ceiling_cap)
 
     # The DuckDB on-ramp: a config that omits `connector:` (or a bare `--path`
     # read with no config) means the free local connector. This default only

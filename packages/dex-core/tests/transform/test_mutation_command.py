@@ -440,6 +440,53 @@ def test_run_hooks_are_stripped_from_the_copy_and_said_so(
     assert "on-run-start" in manifest_path.read_text()
 
 
+def test_shadow_run_strip_semantic_models(project):
+    from exmergo_dex_core.transform.build import ShadowRun
+
+    sem_yaml = project / "models" / "semantic.yml"
+    sem_yaml.write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: fct\n"
+        "semantic_models:\n"
+        "  - name: fct_sem\n"
+        "    model: ref('fct')\n"
+        "metrics:\n"
+        "  - name: m1\n",
+        encoding="utf-8",
+    )
+    with ShadowRun(project, target="dev") as shadow:
+        assert shadow.strip_semantic_models("other_model") is False
+        assert shadow.strip_semantic_models("fct") is True
+        assert shadow.strip_semantic_models("fct") is False
+        shadow_sem = shadow._require_shadow() / "models" / "semantic.yml"
+        assert shadow_sem.is_file()
+        content = shadow_sem.read_text(encoding="utf-8")
+        assert "models:" in content
+        assert "semantic_models:" not in content
+        assert "metrics:" not in content
+    assert "semantic_models:" in sem_yaml.read_text(encoding="utf-8")
+
+
+def test_mutation_coverage_warns_when_semantic_models_stripped(
+    project, recorded_dbt, monkeypatch
+):
+    _calls, plan = recorded_dbt
+    plan["manifest"] = _manifest()
+    plan["results"] = _results()
+    sem_path = project / "models" / "semantic.yml"
+    sem_path.write_text(
+        "version: 2\nsemantic_models:\n  - name: fct_sem\n    model: ref('fct')\n",
+        encoding="utf-8",
+    )
+    _skip_dev_target_check(monkeypatch)
+    result = transform_commands.test_mutations(_engine(project), "fct")
+    assert any(
+        "semantic models referencing 'fct' were omitted" in w for w in result.warnings
+    )
+    assert "semantic_models:" in sem_path.read_text()
+
+
 # --- equivalence on the dev data, faked --------------------------------------
 
 
@@ -927,6 +974,25 @@ def test_the_equivalence_flags_need_a_mutation_run(project, capsys):
     assert "need --mutate" in envelope["errors"][0]
 
 
+def test_the_downstream_flags_need_a_mutation_run(project, capsys):
+    from exmergo_dex_core.cli import main
+
+    rc = main(
+        [
+            "--repo-root",
+            str(project.parent),
+            "transform",
+            "test",
+            "--scaffold",
+            "fct",
+            "--downstream",
+        ]
+    )
+    envelope = json.loads(capsys.readouterr().out)
+    assert rc != 0 and envelope["status"] == "error"
+    assert "need --mutate" in envelope["errors"][0]
+
+
 # --- the real-dbt half ---------------------------------------------------------
 
 
@@ -1051,6 +1117,57 @@ def test_every_kind_of_test_gets_to_answer_for_the_mutant(measurable_project: Pa
     assert "not_null_fct_id" in names
     assert "no_null_region" in names
     assert "fct_pins_its_rules" in names
+
+
+def test_mutation_testing_on_model_referenced_by_semantic_model(
+    measurable_project: Path,
+):
+    """Regression for #727: transform test --mutate fails on any model a
+    semantic model refs because an ephemeral mutant has no relation name.
+    The referencing semantic model must be dropped from the shadow copy so
+    dbt can compile and run data tests on the mutant."""
+
+    pytest.importorskip("dbt.adapters.duckdb")
+    (measurable_project / "models" / "metricflow_time_spine.sql").write_text(
+        "select date '2020-01-01' + cast(i as integer) as date_day "
+        "from range(365) t(i)",
+        encoding="utf-8",
+    )
+    (measurable_project / "models" / "semantic.yml").write_text(
+        "version: 2\n"
+        "semantic_models:\n"
+        "  - name: metricflow_time_spine\n"
+        "    model: ref('metricflow_time_spine')\n"
+        "    primary_entity: date_day\n"
+        "    dimensions:\n"
+        "      - name: date_day\n"
+        "        type: time\n"
+        "        type_params:\n"
+        "          time_granularity: day\n"
+        "  - name: fct_sem\n"
+        "    model: ref('fct')\n"
+        "    entities:\n"
+        "      - name: id\n"
+        "        type: primary\n"
+        "    dimensions:\n"
+        "      - name: region\n"
+        "        type: categorical\n",
+        encoding="utf-8",
+    )
+    (measurable_project / "models" / "schema.yml").write_text(
+        _schema_yml(False), encoding="utf-8"
+    )
+    engine = _engine(measurable_project)
+    engine.build(target="dev")
+
+    result = engine.test_mutations("fct")
+    assert result.counts["generated"] >= 4
+    assert any(
+        "semantic models referencing 'fct' were omitted" in w for w in result.warnings
+    )
+    semantic_file = measurable_project / "models" / "semantic.yml"
+    assert semantic_file.is_file()
+    assert "fct_sem" in semantic_file.read_text(encoding="utf-8")
 
 
 def test_a_mutation_run_writes_nothing_and_materializes_nothing(
@@ -1451,3 +1568,407 @@ def test_clickhouse_cloud_mutation_fails_before_first_run_when_capacity_unproved
         transform_commands.test_mutations(engine, "fct")
 
     assert not [c for c in calls if c["argv"][1] == "test"]
+
+
+# --- downstream tests (#648) ---------------------------------------------------
+
+#: A mart that only counts the model's rows per region. Its singular test pins
+#: every count the mart publishes, which is the coverage the issue had to
+#: duplicate one hop upstream because the mutation run never consulted it.
+SUMMARY_SQL = "select region, count(*) as n from {{ ref('fct') }} group by 1"
+
+SUMMARY_TEST = """with s as (select * from {{ ref('fct_summary') }})
+select 'unexpected' as problem from s where not (region = 'eu' and n = 2)
+union all
+select 'missing' from (select count(*) as c from s) t where c <> 1
+"""
+
+
+def _with_summary(project: Path) -> Path:
+    (project / "models" / "schema.yml").write_text(_schema_yml(False), encoding="utf-8")
+    (project / "models" / "fct_summary.sql").write_text(SUMMARY_SQL, encoding="utf-8")
+    (project / "tests").mkdir(exist_ok=True)
+    (project / "tests" / "assert_summary_counts.sql").write_text(
+        SUMMARY_TEST, encoding="utf-8"
+    )
+    return project
+
+
+def test_a_defect_a_downstream_test_catches_is_reported_apart(
+    measurable_project: Path,
+):
+    """The issue's acceptance on real dbt and DuckDB: `fct` carries only a
+    `not_null`, so every defect survives its own suite, but the dropped status
+    filter brings a cancelled order back and the mart's count test sees it.
+    That defect is `caught_downstream`, and `score` reads exactly what it reads
+    without the downstream tests."""
+
+    pytest.importorskip("dbt.adapters.duckdb")
+    engine = _engine(_with_summary(measurable_project))
+    engine.build(target="dev")
+
+    routed = engine.test_mutations("fct")
+    alone = engine.test_mutations("fct", downstream=False)
+
+    assert routed.downstream["enabled"] is True, routed.downstream
+    assert routed.downstream["models"] == ["fct_summary"]
+    assert routed.downstream["tests"] == ["assert_summary_counts"]
+    statuses = {m["operator"]: m for m in routed.mutants}
+    drop = statuses["predicate_drop"]
+    assert drop["status"] == "caught_downstream"
+    assert drop["caught_by"] == []
+    assert drop["caught_downstream_by"] == ["assert_summary_counts"]
+    # The inner join where every key resolves changes no count in the mart.
+    assert statuses["join_type"]["status"] == "survived"
+
+    assert routed.counts["caught_downstream"] >= 1
+    assert routed.score == alone.score == 0.0
+    assert routed.score_with_downstream > 0.0
+    assert alone.score_with_downstream is None
+    assert alone.downstream["enabled"] is False
+    assert "--no-downstream" in alone.downstream["reason"]
+    assert alone.counts["caught_downstream"] == 0
+    assert any("caught by tests on the models downstream" in w for w in routed.warnings)
+
+
+def test_routing_through_a_downstream_model_writes_and_materializes_nothing(
+    measurable_project: Path,
+):
+    """The mart is made ephemeral in the copy, not rebuilt: the project is a
+    byte for byte match afterwards and the dev warehouse gained no relation and
+    lost none, the mart's own view included."""
+
+    duckdb = pytest.importorskip("duckdb")
+    pytest.importorskip("dbt.adapters.duckdb")
+    engine = _engine(_with_summary(measurable_project))
+    engine.build(target="dev")
+    warehouse = measurable_project.parent / "dev.duckdb"
+
+    def relations():
+        con = duckdb.connect(str(warehouse), read_only=True)
+        try:
+            return set(
+                con.execute(
+                    "select table_schema, table_name, table_type "
+                    "from information_schema.tables"
+                ).fetchall()
+            )
+        finally:
+            con.close()
+
+    before_tree, before_relations = _tree_digest(measurable_project), relations()
+    result = engine.test_mutations("fct")
+
+    assert result.downstream["enabled"] is True
+    assert _tree_digest(measurable_project) == before_tree
+    assert relations() == before_relations
+
+
+def test_a_model_with_only_downstream_tests_is_measured(measurable_project: Path):
+    """With no test of its own, every defect used to be refused as unmeasurable.
+    A mart test that reads it is a test that can catch it."""
+
+    pytest.importorskip("dbt.adapters.duckdb")
+    project = _with_summary(measurable_project)
+    (project / "models" / "schema.yml").unlink()
+    engine = _engine(project)
+    engine.build(target="dev")
+
+    result = engine.test_mutations("fct")
+    assert result.counts["killed"] == 0
+    assert result.counts["caught_downstream"] >= 1
+    assert result.score == 0.0
+
+    with pytest.raises(mutation.MutationError, match="has no tests"):
+        engine.test_mutations("fct", downstream=False)
+
+
+class _DownstreamCopy:
+    """The three things `_DownstreamTests.prepare` asks of a shadow project."""
+
+    def __init__(self, root: Path, manifest: dict, *, compiled=None, fails=False):
+        self.shadow = root
+        self._manifest = manifest
+        self._compiled = compiled if compiled is not None else manifest
+        self._fails = fails
+        self.compiled_selections: list[str] = []
+
+    def manifest(self) -> dict:
+        return self._manifest
+
+    def write(self, rel_path: str, text: str) -> None:
+        (self.shadow / rel_path).write_text(text, encoding="utf-8")
+
+    def compile(self, select: str) -> dict:
+        from exmergo_dex_core.transform.build import DbtRunError
+
+        self.compiled_selections.append(select)
+        if self._fails and " " in select:
+            raise DbtRunError("dbt would not compile it")
+        return self._compiled
+
+
+def _downstream_manifest(mart_materialized: str = "ephemeral") -> dict:
+    manifest = _manifest()
+    nodes = manifest["nodes"]
+    nodes["model.p.mart"] = {
+        "name": "mart",
+        "unique_id": "model.p.mart",
+        "resource_type": "model",
+        "package_name": "p",
+        "language": "sql",
+        "original_file_path": "models/mart.sql",
+        "config": {"materialized": mart_materialized},
+        "depends_on": {"nodes": ["model.p.fct"]},
+    }
+    nodes["model.p.fct"]["resource_type"] = "model"
+    nodes["snapshot.p.snap"] = {
+        "name": "snap",
+        "unique_id": "snapshot.p.snap",
+        "resource_type": "snapshot",
+        "package_name": "p",
+        "depends_on": {"nodes": ["model.p.fct"]},
+    }
+    nodes["test.p.mart_counts"] = {
+        "name": "mart_counts",
+        "unique_id": "test.p.mart_counts",
+        "resource_type": "test",
+        "depends_on": {"nodes": ["model.p.mart"]},
+        "compiled_code": "select 1",
+    }
+    nodes["test.p.mart_vs_snap"] = {
+        "name": "mart_vs_snap",
+        "unique_id": "test.p.mart_vs_snap",
+        "resource_type": "test",
+        "depends_on": {"nodes": ["model.p.mart", "snapshot.p.snap"]},
+        "compiled_code": "select 1",
+    }
+    manifest["unit_tests"] = {
+        "unit_test.p.mart.mart_rules": {
+            "name": "mart_rules",
+            "model": "mart",
+            "depends_on": {"nodes": ["model.p.mart"]},
+        }
+    }
+    manifest["child_map"] = {
+        "model.p.fct": [
+            "model.p.mart",
+            "snapshot.p.snap",
+            "test.p.not_null_fct_a.abc123",
+        ],
+        "model.p.mart": ["test.p.mart_counts", "test.p.mart_vs_snap"],
+        "snapshot.p.snap": ["test.p.mart_vs_snap"],
+    }
+    return manifest
+
+
+def _prepare_downstream(tmp_path: Path, copy=None, **kwargs):
+    from exmergo_dex_core.envelope import Paradigm
+
+    (tmp_path / "models").mkdir(exist_ok=True)
+    (tmp_path / "models" / "mart.sql").write_text("select 1", encoding="utf-8")
+    copy = copy or _DownstreamCopy(tmp_path, _downstream_manifest())
+    options = {
+        "requested": None,
+        "paradigm": Paradigm.FREE_LOCAL,
+        "connector": "duckdb",
+    }
+    options.update(kwargs)
+    check = transform_commands._DownstreamTests.prepare(
+        copy,
+        _downstream_manifest()["nodes"]["model.p.fct"],
+        model="fct",
+        mutation_mod=mutation,
+        **options,
+    )
+    return check, copy
+
+
+def test_the_selection_routes_the_chain_and_excludes_what_cannot_see_the_mutant(
+    tmp_path: Path,
+):
+    """A unit test on the mart reads fixtures, and a test that also reads the
+    snapshot compares the mutant with a table holding the unmutated rows. The
+    model's own tests are never excluded."""
+
+    check, copy = _prepare_downstream(tmp_path)
+    assert check.enabled, check.reason
+    assert check.select == "fct mart"
+    assert check.tests == ["mart_counts"]
+    assert sorted(check.exclude) == ["mart_vs_snap", "unit_test:mart_rules"]
+    assert "not_null_fct_a" in check.direct
+    assert "not_null_fct_a" not in check.exclude
+    assert (
+        "snap" in check.excluded[0]["reason"] or "snap" in check.excluded[1]["reason"]
+    )
+    assert check.summary()["cut"][0]["name"] == "snap"
+    assert mutation.EPHEMERAL_HEADER in (tmp_path / "models" / "mart.sql").read_text()
+    assert copy.compiled_selections == ["fct mart"]
+
+
+def test_downstream_is_opt_in_on_a_billed_connector(tmp_path: Path):
+    from exmergo_dex_core.envelope import Paradigm
+
+    check, copy = _prepare_downstream(
+        tmp_path, paradigm=Paradigm.BYTES_SCANNED, connector="bigquery"
+    )
+    assert not check.enabled
+    assert "--downstream" in check.reason and "opt-in" in check.reason
+    assert check.select == "fct"
+    assert copy.compiled_selections == []
+    assert "with --downstream" in check.no_tests_hint()
+
+    asked, _ = _prepare_downstream(
+        tmp_path, requested=True, paradigm=Paradigm.BYTES_SCANNED, connector="bigquery"
+    )
+    assert asked.enabled
+
+
+def test_no_downstream_is_honoured_on_duckdb(tmp_path: Path):
+    check, copy = _prepare_downstream(tmp_path, requested=False)
+    assert not check.enabled and "--no-downstream" in check.reason
+    assert copy.compiled_selections == []
+    assert check.summary()["tests"] == []
+
+
+def test_a_chain_that_will_not_compile_falls_back_and_puts_every_file_back(
+    tmp_path: Path,
+):
+    (tmp_path / "models").mkdir()
+    copy = _DownstreamCopy(tmp_path, _downstream_manifest(), fails=True)
+    check, _ = _prepare_downstream(tmp_path, copy=copy)
+    assert not check.enabled
+    assert "would not compile as ephemeral" in check.reason
+    assert (tmp_path / "models" / "mart.sql").read_text() == "select 1"
+    assert copy.compiled_selections == ["fct mart", "fct"]
+    assert check.exclude == [] and check.excluded_names == set()
+    # A model with no tests of its own must still be refused, not run against
+    # downstream tests that no longer run.
+    assert check.tests == []
+
+
+def test_a_downstream_model_that_would_still_materialize_turns_routing_off(
+    tmp_path: Path,
+):
+    """The override is what keeps the chain from writing a relation, so a run
+    must not route through a model where it silently did not apply."""
+
+    (tmp_path / "models").mkdir()
+    copy = _DownstreamCopy(
+        tmp_path, _downstream_manifest(), compiled=_downstream_manifest("table")
+    )
+    check, _ = _prepare_downstream(tmp_path, copy=copy)
+    assert not check.enabled
+    assert "could not make 'mart' ephemeral" in check.reason
+    assert (tmp_path / "models" / "mart.sql").read_text() == "select 1"
+
+
+def test_a_leaf_model_says_nothing_reads_it(tmp_path: Path):
+    manifest = _manifest()
+    manifest["child_map"] = {"model.p.fct": ["test.p.not_null_fct_a.abc123"]}
+    check, copy = _prepare_downstream(
+        tmp_path, copy=_DownstreamCopy(tmp_path, manifest)
+    )
+    assert not check.enabled
+    assert check.reason == "no model in this project reads 'fct'"
+    assert copy.compiled_selections == []
+
+
+def test_a_downstream_catch_leaves_the_models_own_score_where_it_was(
+    project, recorded_dbt, monkeypatch
+):
+    """Same suite, same mutants: the only thing downstream tests add is a
+    second score. The model's own score is what it would be without them."""
+
+    calls, plan = recorded_dbt
+    manifest = _downstream_manifest()
+    plan["manifest"] = manifest
+    (project / "models" / "mart.sql").write_text("select 1", encoding="utf-8")
+    manifest["nodes"]["model.p.mart"]["original_file_path"] = "models/mart.sql"
+    own = {"unique_id": "test.p.not_null_fct_a.abc123", "status": "pass"}
+    plan["test_results"] = [
+        [own, {"unique_id": "test.p.mart_counts", "status": "pass"}]
+    ]
+    plan["results"] = [own, {"unique_id": "test.p.mart_counts", "status": "fail"}]
+    _skip_dev_target_check(monkeypatch)
+
+    result = transform_commands.test_mutations(_engine(project), "fct")
+
+    assert result.counts["killed"] == 0
+    assert result.counts["caught_downstream"] == result.counts["generated"]
+    assert result.score == 0.0
+    assert result.score_with_downstream == 1.0
+    assert all(m["caught_downstream_by"] == ["mart_counts"] for m in result.mutants)
+    test_calls = [c["argv"] for c in calls if c["argv"][1] == "test"]
+    for argv in test_calls:
+        assert argv[argv.index("--select") + 1] == "fct mart"
+        assert "unit_test:mart_rules" in argv
+
+
+class _DownstreamPricingCopy:
+    """The model's own test, a mart test that reads the mutant through the
+    mart, and a mart test the runs exclude."""
+
+    _CHAIN = (
+        "with __dbt__cte__fct as (select a from t where a > 1 and b > 2), "
+        "__dbt__cte__mart as (select count(*) as n from __dbt__cte__fct) "
+        "select n from __dbt__cte__mart"
+    )
+
+    def manifest(self):
+        return {
+            "nodes": {
+                "test.p.own": {
+                    "name": "own",
+                    "resource_type": "test",
+                    "compiled_code": (
+                        "with __dbt__cte__fct as (select a from t where a > 1 "
+                        "and b > 2) select count(*) from __dbt__cte__fct"
+                    ),
+                },
+                "test.p.mart_counts": {
+                    "name": "mart_counts",
+                    "resource_type": "test",
+                    "compiled_code": self._CHAIN,
+                },
+                "test.p.mart_vs_snap": {
+                    "name": "mart_vs_snap",
+                    "resource_type": "test",
+                    "compiled_code": f"{self._CHAIN}, s",
+                },
+            }
+        }
+
+
+def test_downstream_tests_are_priced_with_the_mutant_spliced_beneath_the_mart():
+    """A downstream test recomputes the chain, mutant at the bottom, so each
+    mutant is priced through it; a test the runs exclude never runs, so it is
+    priced at nothing rather than inflating the confirmed batch."""
+
+    from exmergo_dex_core.transform.commands import _price_mutations
+
+    batch = mutation.enumerate_mutants(
+        mutation.prepare("select a from t where a > 1 and b > 2", dialect="duckdb")
+    )
+    copy = _DownstreamPricingCopy()
+
+    def priced(skip):
+        return _price_mutations(
+            _TextPricedAdapter(),
+            copy,
+            "models/fct.sql",
+            batch,
+            {"name": "fct"},
+            mutation,
+            skip=skip,
+        )
+
+    _, every, _, _ = priced(frozenset())
+    _, kept, _, _ = priced({"mart_vs_snap"})
+    nodes = copy.manifest()["nodes"]
+    own = len(nodes["test.p.own"]["compiled_code"])
+    mart = len(nodes["test.p.mart_counts"]["compiled_code"])
+    assert kept["(baseline)"] == own + mart
+    assert every["(baseline)"] > kept["(baseline)"]
+    dropped = next(m for m in batch.mutants if m.operator == "predicate_drop")
+    assert kept[f"{dropped.id} predicate_drop"] < kept["(baseline)"]

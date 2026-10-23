@@ -837,13 +837,50 @@ def test_mutation_coverage_prices_its_whole_batch_before_running_any_of_it(
     assert "test" not in invoked
 
 
-def _mutation_dbt(invoked: list[str], *, show_stdout: str = "", on_run=None):
+def _mutation_dbt(
+    invoked: list[str], *, show_stdout: str = "", on_run=None, downstream=False
+):
     """A dbt stand-in for mutation coverage: one model, one test, one comparison.
 
     Every invocation writes the same manifest (the comparison node carries
     compiled SQL that reads the model's CTE, so it can be priced), a test run
-    passes, and a show prints ``show_stdout``.
+    passes, and a show prints ``show_stdout``. ``downstream`` adds a mart that
+    reads the model, with one test whose compiled SQL inlines the chain.
     """
+
+    below: dict = {}
+    child_map: dict = {}
+    if downstream:
+        below = {
+            "model.dex_test.mart": {
+                "name": "mart",
+                "unique_id": "model.dex_test.mart",
+                "resource_type": "model",
+                "package_name": "dex_test",
+                "language": "sql",
+                "original_file_path": "models/staging/mart.sql",
+                "config": {"materialized": "ephemeral"},
+                "depends_on": {"nodes": ["model.dex_test.fct"]},
+            },
+            "test.dex_test.mart_counts": {
+                "name": "mart_counts",
+                "unique_id": "test.dex_test.mart_counts",
+                "resource_type": "test",
+                "depends_on": {"nodes": ["model.dex_test.mart"]},
+                "compiled_code": (
+                    "with __dbt__cte__fct as (select id from raw), "
+                    "__dbt__cte__mart as (select count(*) as n from __dbt__cte__fct) "
+                    "select n from __dbt__cte__mart where n <> 2"
+                ),
+            },
+        }
+        child_map = {
+            "model.dex_test.fct": [
+                "model.dex_test.mart",
+                "test.dex_test.not_null_fct_id.abc",
+            ],
+            "model.dex_test.mart": ["test.dex_test.mart_counts"],
+        }
 
     def factory(timeout, cwd, env=None):
         def run(argv):
@@ -871,8 +908,10 @@ def _mutation_dbt(invoked: list[str], *, show_stdout: str = "", on_run=None):
                 json.dumps(
                     {
                         "metadata": {"project_name": "dex_test"},
+                        "child_map": child_map,
                         "nodes": {
                             **comparison,
+                            **below,
                             "model.dex_test.fct": {
                                 "name": "fct",
                                 "unique_id": "model.dex_test.fct",
@@ -922,6 +961,79 @@ def _mutation_dbt(invoked: list[str], *, show_stdout: str = "", on_run=None):
         return run
 
     return factory
+
+
+@pytest.mark.parametrize(
+    "connector",
+    [
+        "bigquery",
+        "snowflake",
+        "databricks",
+        "redshift",
+        "postgres",
+        "clickhouse",
+        "trino",
+    ],
+)
+def test_downstream_tests_are_opt_in_and_priced_into_the_one_batch_estimate(
+    connector, dbt_project_dir: Path, monkeypatch
+):
+    """A downstream test recomputes the mutant beneath the model it reads, so
+    on a metered connector it is spend: left out unless asked for, and asked
+    for, priced into the one batch the caller confirms before anything runs."""
+
+    from exmergo_dex_core.guards.cost_guard import ConfirmationRequiredError
+    from exmergo_dex_core.transform import commands as transform_commands
+
+    staging = dbt_project_dir / "models" / "staging"
+    (staging / "fct.sql").write_text(
+        "select o.id, o.amount from {{ ref('stg_customers') }} o where o.amount > 1\n",
+        encoding="utf-8",
+    )
+    (staging / "mart.sql").write_text(
+        "select count(*) as n from {{ ref('fct') }}\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        importlib.import_module("exmergo_dex_core.transform.dev_target"),
+        "check",
+        lambda *a, **k: [],
+    )
+    engine = DexEngine(
+        connector=connector,
+        repo_root=str(dbt_project_dir.parent),
+        store=FilesystemStore(dbt_project_dir.parent),
+        config=DexConfig(
+            connector=connector, dbt_target="dev", dbt_project_dir=dbt_project_dir.name
+        ),
+    )
+    monkeypatch.setattr(
+        DexEngine, "_adapter", lambda self, command=None: _EstimatingAdapter(connector)
+    )
+
+    def handshake(**kwargs):
+        invoked: list[str] = []
+        monkeypatch.setattr(
+            importlib.import_module("exmergo_dex_core.transform.build"),
+            "_default_runner",
+            _mutation_dbt(invoked, downstream=True),
+        )
+        with pytest.raises(ConfirmationRequiredError) as raised:
+            transform_commands.test_mutations(
+                engine, "fct", check_equivalence=False, **kwargs
+            )
+        assert "test" not in invoked and "show" not in invoked
+        return raised.value.request.data
+
+    unasked = handshake()
+    asked = handshake(downstream=True)
+    assert (
+        asked["per_table_bytes"]["(baseline)"]
+        > (unasked["per_table_bytes"]["(baseline)"])
+    )
+    assert asked["estimated_bytes"] == sum(asked["per_table_bytes"].values())
+    assert asked["estimated_bytes"] > unasked["estimated_bytes"]
+    assert (staging / "mart.sql").read_text().endswith("}}\n")
+    assert "ephemeral" not in (staging / "mart.sql").read_text()
 
 
 @pytest.mark.parametrize(
@@ -6766,6 +6878,7 @@ def test_maintain_grain_findings_carry_no_example_values(tmp_path: Path, capsys)
     grain = [f for f in payload["data"]["findings"] if f["axis"] == "grain"]
     # `severity_floor_applied`/`grain_min_rows` (#280) are config-derived flags,
     # not row-derived values, so they belong on this allowlist same as the rest.
+    # `joins` (#779) names relations and columns, never their values.
     assert grain and all(
         set(f["data"])
         <= {
@@ -6774,6 +6887,7 @@ def test_maintain_grain_findings_carry_no_example_values(tmp_path: Path, capsys)
             "was_grain",
             "severity_floor_applied",
             "grain_min_rows",
+            "joins",
         }
         or f["code"] != "key_lost_uniqueness"
         for f in grain

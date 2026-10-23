@@ -625,3 +625,164 @@ def test_private_material_never_reaches_a_page(tmp_path):
     problems = messages(make_builder(root).build())
     assert "names a ticket key" in problems
     assert "names the private planning folder" in problems
+
+
+# --- Versions ---------------------------------------------------------------
+
+
+def make_archive(root: Path) -> Path:
+    """The `dex/` folder an older release's own build wrote."""
+
+    root.mkdir(parents=True)
+    (root / "navigation.json").write_text(
+        json.dumps({"product": "Dex", "pages": ["dex/index", "dex/alpha"]}),
+        encoding="utf-8",
+    )
+    (root / "index.mdx").write_text(
+        "---\ntitle: Dex\n---\n\nSee [Alpha](/dex/alpha#top), "
+        '<Card href="/dex/alpha" />, [home](/dex) and [site](https://docs.exmergo.com/dex).\n',
+        encoding="utf-8",
+    )
+    (root / "alpha.mdx").write_text(
+        "---\ntitle: Alpha\n---\n\nOld.\n", encoding="utf-8"
+    )
+    (root / "images").mkdir()
+    (root / "images" / "map.png").write_bytes(b"\x89PNG")
+    (root / "redirects.json").write_text("[]", encoding="utf-8")
+    (root / "README.md").write_text(site.OUT_MARKER + "\n", encoding="utf-8")
+    return root
+
+
+def test_archives_become_versions_beside_the_latest_routes(tmp_path):
+    root = make_repo(tmp_path / "repo")
+    archive = site.Archive("v1.14.1", make_archive(tmp_path / "v1.14"))
+    builder = make_builder(root, archives=(archive,), latest="v1.15.2")
+    assert not builder.build(), messages(builder.problems)
+
+    navigation = json.loads(builder.rendered()["dex/navigation.json"])
+    assert navigation["product"] == "Dex" and "pages" not in navigation
+    latest, older = navigation["versions"]
+    # The menu names minor releases; the exact tag is on the pages' notice.
+    assert latest["version"] == "v1.15" and latest["default"] is True
+    assert latest["tag"] == "Latest" and "tag" not in older
+    assert "dex/alpha" in latest["pages"]  # latest keeps the routes links point at
+    assert older == {
+        "version": "v1.14",
+        "pages": ["dex/v1.14/index", "dex/v1.14/alpha"],
+    }
+
+
+def test_an_archived_page_stays_in_its_version_and_out_of_search(tmp_path):
+    root = make_repo(tmp_path / "repo")
+    archive = site.Archive("v1.14.1", make_archive(tmp_path / "v1.14"))
+    builder = make_builder(root, archives=(archive,), latest="v1.15.2")
+    assert not builder.build(), messages(builder.problems)
+    out = tmp_path / "out"
+    builder.write(out)
+
+    page = (out / "dex" / "v1.14" / "index.mdx").read_text(encoding="utf-8")
+    assert page.startswith("---\nnoindex: true\ntitle: Dex\n---\n\n<Note>\n")
+    assert "[Alpha](/dex/v1.14/alpha#top)" in page
+    assert '<Card href="/dex/v1.14/alpha" />' in page
+    assert "[home](/dex/v1.14)" in page
+    # A full URL is a deliberate link to the live site, and is left alone.
+    assert "[site](https://docs.exmergo.com/dex)" in page
+    assert (out / "dex" / "v1.14" / "images" / "map.png").read_bytes() == b"\x89PNG"
+    # Its menu is folded into the section's; its redirects and README stay behind.
+    for left in ("navigation.json", "redirects.json", "README.md"):
+        assert not (out / "dex" / "v1.14" / left).exists()
+    assert "noindex" not in (out / "dex" / "alpha.mdx").read_text(encoding="utf-8")
+
+
+def test_an_archived_page_names_its_release_and_links_to_the_latest(tmp_path):
+    root = make_repo(tmp_path / "repo")
+    old = make_archive(tmp_path / "v1.14")
+    (old / "gone.mdx").write_text("---\ntitle: Gone\n---\n\nOld.\n", encoding="utf-8")
+    archive = site.Archive("v1.14.1", old)
+    builder = make_builder(root, archives=(archive,), latest="v1.15.2")
+    assert not builder.build(), messages(builder.problems)
+    files = builder.archived()
+
+    index = files["dex/v1.14/index.mdx"].decode("utf-8")
+    assert "You are reading the docs for dex v1.14 (v1.14.1)." in index
+    assert "See the [latest version](/dex)." in index
+    alpha = files["dex/v1.14/alpha.mdx"].decode("utf-8")
+    assert "See the [latest version](/dex/alpha)." in alpha
+    # A page the latest release no longer has sends the reader to its home.
+    gone = files["dex/v1.14/gone.mdx"].decode("utf-8")
+    assert "See the [latest version](/dex)." in gone
+
+
+def test_a_build_without_archives_has_no_version_menu(tmp_path):
+    builder = make_builder(make_repo(tmp_path), latest="v1.15.2")
+    assert not builder.build(), messages(builder.problems)
+    assert "versions" not in json.loads(builder.rendered()["dex/navigation.json"])
+
+
+@pytest.mark.parametrize(
+    ("release", "latest", "expected"),
+    [
+        ("1.14.1", "v1.15.2", "an archive is named by its release: vX.Y.Z"),
+        ("v1.14", "v1.15.2", "an archive is named by its release: vX.Y.Z"),
+        ("v1.15.0", "v1.15.2", "v1.15 is listed more than once"),
+        ("v1.14.1", "v1.15", "the latest version is a release: vX.Y.Z"),
+    ],
+)
+def test_an_archive_must_name_a_release_of_another_minor(
+    tmp_path, release, latest, expected
+):
+    archive = site.Archive(release, make_archive(tmp_path / "old"))
+    builder = make_builder(
+        make_repo(tmp_path / "repo"), archives=(archive,), latest=latest
+    )
+    assert expected in messages(builder.build())
+
+
+def test_an_archive_must_hold_every_page_its_menu_lists(tmp_path):
+    old = make_archive(tmp_path / "old")
+    (old / "alpha.mdx").unlink()
+    builder = make_builder(
+        make_repo(tmp_path / "repo"), archives=(site.Archive("v1.14.1", old),)
+    )
+    assert "its menu lists dex/alpha, which it lacks" in messages(builder.build())
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    builder = make_builder(
+        make_repo(tmp_path / "repo2"), archives=(site.Archive("v1.14.1", empty),)
+    )
+    assert "holds no built section" in messages(builder.build())
+
+
+def test_a_backfilled_release_drops_only_the_menu_pages_it_cannot_build():
+    """A release from before the site lacks command groups added later, so its
+    menu loses those pages, and a group left empty goes with them."""
+
+    spec = importlib.util.spec_from_file_location(
+        "build_docs_backfill", ROOT / "scripts" / "build_docs_backfill.py"
+    )
+    backfill = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(backfill)
+    menu = {
+        "product": "Dex",
+        "tabs": [
+            {"tab": "Docs", "groups": [{"group": "Start", "pages": ["index"]}]},
+            {
+                "tab": "Reference",
+                "groups": [
+                    {"group": "CLI", "pages": ["cli/overview", "cli/config"]},
+                    {"group": "Later", "pages": ["cli/viz"]},
+                ],
+            },
+        ],
+    }
+    kept = backfill.prune(menu, {"index", "cli/overview"})
+    assert kept == {
+        "product": "Dex",
+        "tabs": [
+            {"tab": "Docs", "groups": [{"group": "Start", "pages": ["index"]}]},
+            {
+                "tab": "Reference",
+                "groups": [{"group": "CLI", "pages": ["cli/overview"]}],
+            },
+        ],
+    }

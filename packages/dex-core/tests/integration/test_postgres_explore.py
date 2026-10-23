@@ -67,6 +67,33 @@ def test_over_ceiling_refusal_is_live_and_loads_nothing(tmp_path: Path, capsys):
     assert "exceeds the ceiling" in envelope["errors"][0]
 
 
+def test_a_host_cap_binds_over_a_generous_budget_live(
+    tmp_path: Path, capsys, monkeypatch
+):
+    """#787: the project's own config declines a cumulative ceiling and the
+    command passes a generous --budget; the host's cap still binds, and the
+    refusal names it as the only thing that can raise it."""
+
+    seed_repo(tmp_path, schemas=["app"])
+    monkeypatch.setenv("DEX_SESSION_CEILING_CAP", "0.01")
+    rc, envelope = run_cli(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "explore",
+            "profile",
+            "app.events",
+            "--confirm",
+            "--budget",
+            "600",
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert "DEX_SESSION_CEILING_CAP=0.01" in envelope["errors"][0]
+    assert envelope["data"]["session_ceiling_cap"]["source"] == "environment"
+
+
 def test_confirmed_map_profiles_flags_pii_and_infers_the_missing_fk(
     tmp_path: Path, capsys
 ):

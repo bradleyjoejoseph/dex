@@ -52,6 +52,7 @@ from typing import Any
 from ..envelope import Cost, EstimateQuality, Paradigm
 from ..errors import DexError
 from ..results import ConfirmationRequest
+from ..session_cap import SessionCeilingCap
 
 
 class CostGuardError(DexError):
@@ -811,10 +812,16 @@ class CostGate:
         session_ceiling_declined: bool = False,
         config_path: Path | None = None,
         history: Callable[[], list[dict]] | None = None,
+        session_ceiling_cap: SessionCeilingCap | None = None,
     ):
         self.paradigm = paradigm
         self.ceiling = ceiling
         self.session_ceiling = session_ceiling
+        # The host's cap (#787), already folded into `session_ceiling` by
+        # whoever built the gate. Held only so a refusal it causes can name it:
+        # "raise the session budget in .dex/config.yml" is wrong advice when
+        # nothing the file says can lift the bound.
+        self.session_ceiling_cap = session_ceiling_cap
         # What this connector's pricing method can achieve at best. Set by the
         # adapter after construction (the gate is built before the adapter that
         # owns it), and read only where a cost is reported, so a gate nobody set
@@ -1216,8 +1223,40 @@ class CostGate:
             # refusal's history read. Re-raised rather than mutated, the way
             # every other refusal in this engine that gains a clause is, so the
             # exception stays a plain immutable refusal carrying the same cost.
-            raise self._calibrated(exc) from exc
+            raise self._calibrated(self._capped(exc)) from exc
         return cost
+
+    def cap_binds(self) -> bool:
+        """Whether the host's cap is what an over-ceiling refusal ran into: a
+        cap is set, it is the ceiling in force (not a lower committed one), and
+        the day's remainder rather than the per-command budget is the tighter
+        bound. Read only on a refusal, so the readings it needs already exist."""
+
+        cap = self.session_ceiling_cap
+        if cap is None or self.session_ceiling is None:
+            return False
+        if self.session_ceiling < cap.value:
+            return False
+        if self.session_spent is None:
+            return False
+        remaining = max(self.session_ceiling - self.session_spent, 0.0)
+        return self.ceiling is None or remaining < self.ceiling
+
+    def _capped(self, exc: OverCeilingError) -> OverCeilingError:
+        """``exc`` naming the host's cap as its source, when the cap is what
+        bound; ``exc`` untouched otherwise, so a run with no cap refuses in
+        exactly the words it always has."""
+
+        if self.session_ceiling_cap is None or not self.cap_binds():
+            return exc
+        capped = OverCeilingError(
+            f"{exc}. The daily ceiling in force is "
+            f"{self.session_ceiling_cap.named()}; neither --budget nor "
+            ".dex/config.yml can raise it, only the host can",
+            cost=exc.cost,
+        )
+        capped.__cause__ = exc
+        return capped
 
     def _calibrated(self, exc: OverCeilingError) -> OverCeilingError:
         """``exc`` with what the ledger knows about this connector's estimates.
@@ -1367,6 +1406,12 @@ class CostGate:
         The reading has to exist before a ceiling derived from it can be trusted.
         """
 
+        try:
+            self._charge(estimate)
+        except OverCeilingError as exc:
+            raise self._capped(exc) from exc
+
+    def _charge(self, estimate: float) -> None:
         needed = self._estimated + estimate
         unmeasured_session = (
             self.session_ceiling is not None and self.session_spent is None

@@ -488,6 +488,73 @@ class ShadowRun:
         manifest.write_text(yaml.safe_dump(parsed, sort_keys=False), encoding="utf-8")
         return True
 
+    def strip_semantic_models(self, model: str) -> bool:
+        """Drop semantic models referencing ``model`` from the copy.
+
+        An ephemeral mutant has no relation name, so dbt's semantic validator
+        (PydanticSemanticModel) fails project parsing when any semantic model
+        references it. Mutation testing only runs data and unit tests, which
+        never evaluate the semantic layer, so dropping referencing semantic
+        models (and dependent metrics/saved queries) from the shadow copy allows
+        dbt to compile and test the ephemeral mutant safely.
+
+        Returns True if any semantic declarations were removed.
+        """
+
+        from ..dbt_project import REF_PATTERN
+
+        shadow = self._require_shadow()
+        yaml_files = [
+            p
+            for p in shadow.rglob("*")
+            if p.is_file()
+            and p.suffix in (".yml", ".yaml")
+            and not any(part in {"target", "logs", ".git", ".dex"} for part in p.parts)
+        ]
+
+        matching_files: list[tuple[Path, dict[str, Any]]] = []
+        model_referenced = False
+
+        for path in yaml_files:
+            try:
+                parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
+            except yaml.YAMLError:
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            matching_files.append((path, parsed))
+            for entry in parsed.get("semantic_models") or []:
+                if not isinstance(entry, dict):
+                    continue
+                target = entry.get("model")
+                if not isinstance(target, str):
+                    continue
+                m = REF_PATTERN.search(target)
+                ref_name = m.group(1) if m else target.strip()
+                if ref_name == model:
+                    model_referenced = True
+
+        if not model_referenced:
+            return False
+
+        stripped = False
+        semantic_keys = ("semantic_models", "metrics", "saved_queries")
+        for path, parsed in matching_files:
+            present = [k for k in semantic_keys if k in parsed]
+            if not present:
+                continue
+            for k in present:
+                parsed.pop(k)
+            stripped = True
+            remaining = [k for k in parsed if k != "version"]
+            if not remaining:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_text(
+                    yaml.safe_dump(parsed, sort_keys=False), encoding="utf-8"
+                )
+        return stripped
+
     def manifest(self) -> dict[str, Any]:
         path = self._require_shadow() / "target" / "manifest.json"
         if not path.is_file():
@@ -1347,8 +1414,9 @@ _RUN_RESULT_ERROR = "RunResultError"
 # because #50's own repro didn't spell one out in its test message (#76).
 _GENERIC_HEADER = re.compile(
     r"^(?:\[[A-Z]+\]:\s*)?(?:Encountered an error:|"
-    r"(?:Database|Runtime|Compilation|Validation|Internal) Error(?: in .+)?)$"
+    r"(?:Database|Runtime|Compilation|Validation|Internal|Parsing) Error(?: in .+)?)$"
 )
+_VALIDATION_HEADER = re.compile(r"^\d+ validation errors? for .+$")
 
 # dbt colors its console messages (red failures, yellow warnings) even under
 # --log-format json, baking raw ANSI escapes into info.msg; harmless on a
@@ -1388,17 +1456,45 @@ def _collect_messages(
         msg = redact(_ANSI_ESCAPE.sub("", str(info["msg"])))
         msg_lines = msg.splitlines()
         first_line = msg_lines[0].strip() if msg_lines else msg.strip()
-        if _GENERIC_HEADER.match(first_line):
-            cause = next(
-                (
-                    stripped
-                    for line in msg_lines[1:]
-                    if (stripped := line.strip())
-                    and not _GENERIC_HEADER.match(stripped)
-                ),
-                None,
-            )
-            if cause:
+        if _VALIDATION_HEADER.match(first_line):
+            details = []
+            for candidate in msg_lines[1:]:
+                s = candidate.strip()
+                if (
+                    not s
+                    or _GENERIC_HEADER.match(s)
+                    or s.startswith(
+                        ("Traceback", "compiled code at", "compiled SQL at")
+                    )
+                ):
+                    break
+                details.append(s)
+            if details:
+                first_line = f"{first_line}: {': '.join(details)}"
+        elif _GENERIC_HEADER.match(first_line):
+            idx = None
+            for i, candidate in enumerate(msg_lines[1:], start=1):
+                stripped = candidate.strip()
+                if stripped and not _GENERIC_HEADER.match(stripped):
+                    idx = i
+                    break
+            if idx is not None:
+                cause = msg_lines[idx].strip()
+                if _VALIDATION_HEADER.match(cause):
+                    details = []
+                    for candidate in msg_lines[idx + 1 :]:
+                        s = candidate.strip()
+                        if (
+                            not s
+                            or _GENERIC_HEADER.match(s)
+                            or s.startswith(
+                                ("Traceback", "compiled code at", "compiled SQL at")
+                            )
+                        ):
+                            break
+                        details.append(s)
+                    if details:
+                        cause = f"{cause}: {': '.join(details)}"
                 sep = "" if first_line.endswith(":") else ":"
                 first_line = f"{first_line}{sep} {cause}"
         if len(first_line) > _MESSAGE_MAX_CHARS:

@@ -186,7 +186,9 @@ later release adds fails the suite until someone decides it is safe. Override
 ## What it does not claim
 
 These are residual risks the mode names rather than closes. A host bounds them
-with a cost ceiling and a query count per run.
+with a cost ceiling it pins itself (`DEX_SESSION_CEILING_CAP`; see
+[`cost-controls.md`](cost-controls.md#a-host-set-cap-on-the-daily-ceiling)) and a
+query count per run.
 
 - **Membership probing.** `select count(*) from t where email = 'a@b.c'` returns a
   number, and enough such probes test guesses about values.

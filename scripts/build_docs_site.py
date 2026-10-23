@@ -3,7 +3,8 @@
 
 Usage:
     uv run --project packages/dex-core python scripts/build_docs_site.py \
-        [--out DIR] [--release vX.Y.Z] [--require-help] [--site DOCS_CHECKOUT]
+        [--out DIR] [--release vX.Y.Z] [--require-help] [--site DOCS_CHECKOUT] \
+        [--latest vX.Y.Z] [--archive vX.Y.Z=DIR ...]
 
 docs.exmergo.com is served from exmergo/docs, which owns the site's settings and
 home page; each product publishes one folder of it. This script builds the Dex
@@ -22,6 +23,11 @@ It reads four sources and writes nothing back into the repository:
   - the CLI parser: one reference page per command group, rendered from the
     same argparse tree `dex --help` prints.
   - `CHANGELOG.md`: the most recent releases.
+
+With `--archive`, older minor releases stay readable beside the latest one, in a
+version switcher: latest at the routes it has always had, and each archive under
+its label (`/dex/v1.14/...`). An archive is the `dex/` folder that release's own
+script built from its own tag, so it shows exactly what was published for it.
 
 `references/` stays the one place a fact changes. The pages it publishes are
 transformed copies (MDX escaping, links rewritten to site routes, the H1 lifted
@@ -1045,6 +1051,63 @@ def _prefix_pages(node: Any, prefix: str) -> Any:
     return node
 
 
+def _relocate_pages(node: Any, label: str) -> Any:
+    """An archived navigation tree with every page id moved into `dex/<label>/`."""
+
+    if isinstance(node, str):
+        return f"{SECTION}/{label}/{node.removeprefix(f'{SECTION}/')}"
+    if isinstance(node, list):
+        return [_relocate_pages(item, label) for item in node]
+    if isinstance(node, dict):
+        return {
+            key: _relocate_pages(value, label) if key in NAVIGATION_BODY else value
+            for key, value in node.items()
+        }
+    return node
+
+
+#: The keys of a navigation entry that hold its pages; the others (`product`,
+#: `description`) name the entry, and stay on the product when it gains versions.
+NAVIGATION_BODY = ("tabs", "groups", "pages", "anchors", "dropdowns")
+
+#: A release as the version menu names it: `v1.14.1`.
+RELEASE_TAG = re.compile(r"v\d+\.\d+\.\d+")
+
+
+def _minor(release: str) -> str:
+    """The minor release a tag belongs to: `v1.14` for `v1.14.1`."""
+
+    return ".".join(release.split(".")[:2])
+
+
+#: A link to a route of this section, in Markdown or in a component's `href`.
+#: An archived page's links are moved into its own version, so a reader who
+#: picked v1.14 stays in v1.14 as they follow them.
+SECTION_LINK = re.compile(r'(\]\(|href=")/' + SECTION + r'(?=[/#)"])')
+
+
+@dataclass(frozen=True)
+class Archive:
+    """An older minor release's section, readable beside the latest one.
+
+    `path` is the `dex/` folder that release's own `build_docs_site.py` wrote
+    from its own tag, so an archive shows exactly what was published for it.
+    Nothing is stored between releases: CI rebuilds every archive on each run,
+    which is also what drops a minor release once it falls out of range.
+
+    `release` is the exact tag it was built from, which its pages' notice
+    names; the menu, its folder and its route use that release's minor, so a
+    link to `/dex/v1.14/` survives a patch release.
+    """
+
+    release: str
+    path: Path
+
+    @property
+    def label(self) -> str:
+        return _minor(self.release)
+
+
 def _json(value: Any) -> str:
     return json.dumps(value, indent=2, ensure_ascii=False) + "\n"
 
@@ -1114,6 +1177,10 @@ class SiteBuilder:
     generated_pages: dict[str, PageMeta] = field(
         default_factory=lambda: dict(GENERATED_PAGES)
     )
+    #: Older minor releases, newest first, each shown as a version in the menu.
+    archives: tuple[Archive, ...] = ()
+    #: The release this build is (`v1.15.2`), which names it in the menu.
+    latest: str | None = None
 
     def __post_init__(self) -> None:
         self.pages: dict[str, Page] = {}
@@ -1594,6 +1661,8 @@ class SiteBuilder:
         # The two files exmergo/docs's docs.json reads with `$ref`, so this
         # section owns its own menu and redirects without editing the shared file.
         navigation = _prefix_pages(self.config.get("navigation", {}), f"{SECTION}/")
+        if self.archives:
+            navigation = self.versioned_navigation(navigation)
         files[f"{SECTION}/navigation.json"] = _json(navigation)
         files[f"{SECTION}/redirects.json"] = _json(self.redirects())
         files[f"{SECTION}/README.md"] = (
@@ -1604,6 +1673,122 @@ class SiteBuilder:
             f"`CHANGELOG.md` or the CLI in {GITHUB} instead.\n"
         )
         return files
+
+    # Versions ----------------------------------------------------------------
+
+    def versioned_navigation(self, navigation: dict[str, Any]) -> dict[str, Any]:
+        """The section's menu with a version switcher: latest, then each archive.
+
+        Latest keeps the routes it has always had, so every link already shared
+        still lands on the current docs; an archive lives under its label.
+        """
+
+        def body(entry: dict[str, Any]) -> dict[str, Any]:
+            return {k: v for k, v in entry.items() if k in NAVIGATION_BODY}
+
+        # The menu names minor releases, as most versioned docs do: a patch
+        # changes little, and the archived pages' notice names the exact tag.
+        # "Latest" is the version's tag, the badge the menu shows beside its
+        # name, so the name stays a plain release like every other entry.
+        versions = [
+            {
+                "version": _minor(self.latest) if self.latest else "Latest",
+                "default": True,
+                **({"tag": "Latest"} if self.latest else {}),
+                **body(navigation),
+            }
+        ]
+        for archive in self.archives:
+            path = archive.path / "navigation.json"
+            if not path.is_file():
+                continue  # reported by _validate_archives
+            menu = json.loads(path.read_text(encoding="utf-8"))
+            versions.append(
+                {"version": archive.label, **body(_relocate_pages(menu, archive.label))}
+            )
+        head = {k: v for k, v in navigation.items() if k not in NAVIGATION_BODY}
+        return {**head, "versions": versions}
+
+    def archived(self) -> dict[str, bytes]:
+        """Every file the archives add, keyed by its path in the output.
+
+        Pages are kept as their release built them, with three changes: their
+        links stay inside their version, `noindex` keeps them out of search, so a
+        search always lands on the latest docs, and a notice at the top names the
+        release and links to the latest docs, since a reader who arrives from an
+        old link never saw the version menu. Each archive's own menu is folded
+        into the section's, and its redirects and README are left behind.
+        """
+
+        files: dict[str, bytes] = {}
+        for archive in self.archives:
+            for source in sorted(archive.path.rglob("*")):
+                rel = source.relative_to(archive.path).as_posix()
+                if not source.is_file() or rel in {
+                    "navigation.json",
+                    "redirects.json",
+                    "README.md",
+                }:
+                    continue
+                name = f"{SECTION}/{archive.label}/{rel}"
+                if source.suffix != ".mdx":
+                    files[name] = source.read_bytes()
+                    continue
+                text = source.read_text(encoding="utf-8")
+                text = SECTION_LINK.sub(rf"\1/{SECTION}/{archive.label}", text)
+                notice = self._archive_notice(archive, rel.removesuffix(".mdx"))
+                if text.startswith("---\n"):
+                    end = text.find("\n---\n", 4)
+                    if end != -1:
+                        end += len("\n---\n")
+                        text = f"{text[:end]}\n{notice}\n{text[end:]}"
+                    text = "---\nnoindex: true\n" + text[4:]
+                files[name] = text.encode("utf-8")
+        return files
+
+    def _archive_notice(self, archive: Archive, page: str) -> str:
+        """The callout an archived page opens with: which release it shows, and
+        the same page in the latest docs, or the section's home where the latest
+        release no longer has it."""
+
+        target = self.route_for(page if page in self.pages else "index")
+        return (
+            f"<Note>\n  You are reading the docs for dex {archive.label} "
+            f"({archive.release}). See the [latest version]({target}).\n</Note>\n"
+        )
+
+    def _validate_archives(self) -> None:
+        if self.latest is not None and not RELEASE_TAG.fullmatch(self.latest):
+            self.problems.append(
+                Problem("--latest", 1, "the latest version is a release: vX.Y.Z")
+            )
+        labels = [archive.label for archive in self.archives]
+        for archive in self.archives:
+            where = f"--archive {archive.release}"
+            if not RELEASE_TAG.fullmatch(archive.release):
+                self.problems.append(
+                    Problem(where, 1, "an archive is named by its release: vX.Y.Z")
+                )
+                continue
+            if (
+                self.latest is not None and archive.label == _minor(self.latest)
+            ) or labels.count(archive.label) > 1:
+                self.problems.append(
+                    Problem(where, 1, f"{archive.label} is listed more than once")
+                )
+            menu = archive.path / "navigation.json"
+            if not menu.is_file():
+                self.problems.append(
+                    Problem(where, 1, f"{archive.path} holds no built section")
+                )
+                continue
+            pages = _navigation_pages(json.loads(menu.read_text(encoding="utf-8")))
+            for page in pages:
+                rel = page.removeprefix(f"{SECTION}/")
+                if not (archive.path / f"{rel}.mdx").is_file():
+                    self.problems.append(
+                        Problem(where, 1, f"its menu lists {page}, which it lacks")
+                    )
 
     def check_output(self) -> None:
         """Checks that read the emitted text rather than the sources."""
@@ -1690,11 +1875,17 @@ class SiteBuilder:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)
             written.append(name)
+        for name, data in sorted(self.archived().items()):
+            target = out / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            written.append(name)
         return written
 
     def build(self) -> list[Problem]:
         self.collect()
         self.validate()
+        self._validate_archives()
         self.check_output()
         return sorted(set(self.problems))
 
@@ -1723,14 +1914,38 @@ def main(argv: list[str] | None = None) -> int:
         help="a checkout of exmergo/docs: write the whole site, with this section "
         "in place of its dex/ folder, for validating and previewing",
     )
+    parser.add_argument(
+        "--archive",
+        action="append",
+        default=[],
+        metavar="vX.Y.Z=DIR",
+        help="an older minor release to keep readable: the tag it was built from "
+        "and the dex/ folder that build wrote. Repeatable, newest first; each "
+        "becomes a version in the menu, served under /dex/vX.Y/",
+    )
+    parser.add_argument(
+        "--latest",
+        metavar="vX.Y.Z",
+        help="the release this build is, which names it in the version menu; "
+        "defaults to --release",
+    )
     args = parser.parse_args(argv)
     if args.site is not None and not (args.site / "docs.json").is_file():
         parser.error(f"--site {args.site} holds no docs.json")
+    archives = []
+    for spec in args.archive:
+        release, sep, directory = spec.partition("=")
+        if not sep or not directory:
+            parser.error(f"--archive {spec}: expected vX.Y.Z=DIR")
+        archives.append(Archive(release, Path(directory)))
+    latest = args.latest or args.release
 
     builder = SiteBuilder(
         ref=args.release or "main",
         release=args.release,
         require_help=args.require_help,
+        archives=tuple(archives),
+        latest=latest,
     )
     problems = builder.build()
     if problems:

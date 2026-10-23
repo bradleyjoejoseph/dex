@@ -30,11 +30,26 @@ def test_duplicated_key_is_detected_exactly(maintain_repo):
     assert finding["column"] == "order_id"
     assert finding["severity"] == "high"
     assert finding["exact"] is True
+    # The map infers the stg_orders join in both directions, and both use the key.
+    order_ids = {"from_columns": ["order_id"], "to_columns": ["order_id"]}
     assert finding["data"] == {
         "distinct_count": 200,
         "row_count": 210,
         "was_grain": True,
+        "joins": [
+            {
+                **order_ids,
+                "from_dataset": "warehouse.main.orders",
+                "to_dataset": "warehouse.main.stg_orders",
+            },
+            {
+                **order_ids,
+                "from_dataset": "warehouse.main.stg_orders",
+                "to_dataset": "warehouse.main.orders",
+            },
+        ],
     }
+    assert finding["detail"].endswith("joins on it will fan out")
     # order_id is the semantic model's entity, so every metric on it is at risk.
     assert finding["impacted_models"] == ["stg_orders"]
     assert finding["impacted_metrics"] == ["order_volume", "revenue"]
@@ -1228,3 +1243,160 @@ def test_a_lost_key_is_caught_where_rows_are_only_counted_by_the_scan(
         ("id", 50),
         ("id, owner", 50),
     }
+
+
+# --- the fan-out clause names the joins it is about (#779) ------------------------
+
+
+class _TwoTableAdapter(_SingleAndComboAdapter):
+    """Both ends of a join must be live for the plan to count it."""
+
+    def list_objects(self, *, include_views: bool = True):
+        return [
+            self.table_metadata(identifier)[0]
+            for identifier in ("db.s.line_items", "db.s.orders")
+        ]
+
+
+def _joined_snapshot(dataset, *relationships):
+    from exmergo_dex_core.maintain.snapshot import Snapshot, WarehouseBaseline
+
+    return Snapshot.model_construct(
+        warehouse=WarehouseBaseline.model_construct(
+            datasets=[dataset], relationships=list(relationships)
+        )
+    )
+
+
+def _rel(from_dataset, from_columns, to_dataset, to_columns):
+    from exmergo_dex_core.cache import Relationship
+
+    # Unverified on purpose: an inferred join is still a join on the key.
+    return Relationship(
+        from_dataset=from_dataset,
+        from_columns=from_columns,
+        to_dataset=to_dataset,
+        to_columns=to_columns,
+    )
+
+
+def test_a_lost_key_names_the_joins_that_use_it():
+    from exmergo_dex_core.maintain.drift import grain_drift, grain_plan
+
+    dataset, _snap = _single_key_snapshot()
+    snap = _joined_snapshot(
+        dataset,
+        _rel("db.s.orders", ["order_key"], "db.s.line_items", ["order_key"]),
+        # Joins on another column, so it is not about this key.
+        _rel("db.s.line_items", ["line_number"], "db.s.orders", ["line_number"]),
+    )
+    adapter = _TwoTableAdapter(rows=1000, combo_count=None, key_count=900)
+    (finding,) = grain_drift(adapter, grain_plan(adapter, snap))
+    assert finding.code == "key_lost_uniqueness"
+    assert finding.detail.endswith("joins on it will fan out")
+    assert finding.data["joins"] == [
+        {
+            "from_dataset": "db.s.orders",
+            "from_columns": ["order_key"],
+            "to_dataset": "db.s.line_items",
+            "to_columns": ["order_key"],
+        }
+    ]
+
+
+def test_a_lost_key_no_join_uses_says_so():
+    from exmergo_dex_core.maintain.drift import grain_drift, grain_plan
+
+    dataset, _snap = _single_key_snapshot()
+    snap = _joined_snapshot(
+        dataset,
+        _rel("db.s.line_items", ["line_number"], "db.s.orders", ["line_number"]),
+    )
+    adapter = _TwoTableAdapter(rows=1000, combo_count=None, key_count=900)
+    (finding,) = grain_drift(adapter, grain_plan(adapter, snap))
+    assert finding.code == "key_lost_uniqueness"
+    assert "fan out" not in finding.detail
+    assert finding.detail.endswith("no known join uses it")
+    assert "joins" not in finding.data
+
+
+def test_a_join_to_a_relation_that_is_gone_does_not_count():
+    from exmergo_dex_core.maintain.drift import grain_drift, grain_plan
+
+    dataset, _snap = _single_key_snapshot()
+    snap = _joined_snapshot(
+        dataset,
+        _rel("db.s.dropped", ["order_key"], "db.s.line_items", ["order_key"]),
+    )
+    adapter = _TwoTableAdapter(rows=1000, combo_count=None, key_count=900)
+    (finding,) = grain_drift(adapter, grain_plan(adapter, snap))
+    assert finding.detail.endswith("no known join uses it")
+    assert "joins" not in finding.data
+
+
+def test_a_lost_composite_names_the_joins_that_use_it():
+    from exmergo_dex_core.maintain.drift import grain_drift, grain_plan
+
+    dataset, _snap = _composite_snapshot()
+    snap = _joined_snapshot(
+        dataset,
+        # Same combination in another order: still a join on this grain.
+        _rel(
+            "db.s.line_items",
+            ["line_number", "order_key"],
+            "db.s.orders",
+            ["line_number", "order_key"],
+        ),
+        # One member alone is not a join on the combination.
+        _rel("db.s.orders", ["order_key"], "db.s.line_items", ["order_key"]),
+    )
+    adapter = _TwoTableAdapter(rows=1000, combo_count=950, key_count=1000)
+    (finding,) = grain_drift(adapter, grain_plan(adapter, snap))
+    assert finding.code == "key_lost_uniqueness"
+    assert finding.detail.endswith("joins on it will fan out")
+    assert finding.data["joins"] == [
+        {
+            "from_dataset": "db.s.line_items",
+            "from_columns": ["line_number", "order_key"],
+            "to_dataset": "db.s.orders",
+            "to_columns": ["line_number", "order_key"],
+        }
+    ]
+
+
+def test_a_lost_composite_no_join_uses_says_so():
+    from exmergo_dex_core.maintain.drift import grain_drift, grain_plan
+
+    dataset, _snap = _composite_snapshot()
+    snap = _joined_snapshot(
+        dataset,
+        _rel("db.s.orders", ["order_key"], "db.s.line_items", ["order_key"]),
+    )
+    adapter = _TwoTableAdapter(rows=1000, combo_count=950, key_count=1000)
+    (finding,) = grain_drift(adapter, grain_plan(adapter, snap))
+    assert finding.code == "key_lost_uniqueness"
+    assert finding.detail.endswith("no known join uses it")
+    assert "joins" not in finding.data
+
+
+@pytest.mark.parametrize("joined", [True, False])
+def test_a_false_declared_grain_names_its_joins_only_when_there_are_some(joined):
+    from exmergo_dex_core.maintain.drift import grain_drift, grain_plan
+
+    dataset, _snap = _single_key_snapshot()
+    combo = ["order_key", "line_number"]
+    snap = _joined_snapshot(
+        dataset,
+        *([_rel("db.s.orders", combo, "db.s.line_items", combo)] if joined else []),
+    )
+    adapter = _TwoTableAdapter(rows=1000, combo_count=900, key_count=1000)
+    plan = grain_plan(adapter, snap, None, _declaring(("line_items", combo)))
+    (finding,) = grain_drift(adapter, plan)
+    assert finding.code == "declared_grain_not_unique"
+    assert "Builds asserting this grain will fail" in finding.detail
+    if joined:
+        assert finding.detail.endswith("joins on it will fan out")
+        assert [j["from_dataset"] for j in finding.data["joins"]] == ["db.s.orders"]
+    else:
+        assert finding.detail.endswith("no known join uses it")
+        assert "joins" not in finding.data

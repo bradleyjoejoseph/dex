@@ -41,6 +41,13 @@ between the mutant's rows and the model's, counted over whole-row fingerprints.
 It counts a multiset rather than a set, so a mutant that only duplicates rows
 still differs, and it projects four integers and nothing else, so no row value
 can leave the warehouse through it.
+
+A defect is also caught if a test on a model *downstream* fails. dbt inlines an
+ephemeral model into whatever reads it, so making the models that read the
+mutant ephemeral too routes the defect through them and into their tests with
+nothing materialized. :func:`downstream_closure` decides which of them can carry
+it, and :func:`classify` keeps a catch there apart from a catch by the model's own
+tests, so the per-model score still answers for the model's own suite.
 """
 
 from __future__ import annotations
@@ -61,6 +68,12 @@ from ..errors import DexError
 #: ask for fewer; nothing may ask for more, because the ceiling is what makes the
 #: command's cost predictable before it is priced.
 MAX_MUTANTS = 20
+
+#: How many models downstream of the mutant a run will route it through. Each
+#: one is inlined, with the mutant beneath it, into every test that reads it, so
+#: the statements grow with the chain; the nearest models are the ones whose
+#: tests most often pin what the mutated model feeds them, so they are kept first.
+MAX_DOWNSTREAM_MODELS = 50
 
 #: What every mutant is written into the copied project with. Appended rather
 #: than prepended: dbt gives scalar config keys to the *last* ``config()`` call
@@ -322,11 +335,37 @@ class MutantBatch:
 
 @dataclass(frozen=True)
 class Verdict:
-    """What one mutant's run says about the suite."""
+    """What one mutant's run says about the suite.
+
+    ``caught_by`` names the model's own tests that failed; ``caught_downstream``
+    the tests on models downstream of it that did, which is reported even when
+    the model's own tests caught the defect too.
+    """
 
     outcome: str
     caught_by: list[str] = field(default_factory=list)
     warn_only: bool = False
+    caught_downstream: list[str] = field(default_factory=list)
+
+
+@dataclass
+class DownstreamClosure:
+    """The models a mutant can be routed through, and the ones it cannot.
+
+    ``eligible`` is in walk order, nearest first. ``cut`` names each model where
+    the walk stopped and why; nothing below a cut model is visited, because the
+    mutant cannot pass through a relation that is read as it stands in the
+    warehouse. ``elided`` counts the eligible models the cap left out, which
+    are cut in the same sense.
+    """
+
+    eligible: list[str] = field(default_factory=list)
+    cut: list[dict[str, str]] = field(default_factory=list)
+    elided: int = 0
+
+    @property
+    def blocked(self) -> set[str]:
+        return {entry["unique_id"] for entry in self.cut}
 
 
 @dataclass(frozen=True)
@@ -808,6 +847,7 @@ def classify(
     run: dict[str, str] | None,
     *,
     warn_severity: Iterable[str] = (),
+    downstream: Iterable[str] = (),
 ) -> Verdict:
     """What one mutant's test statuses say, judged only against what passed before.
 
@@ -820,6 +860,11 @@ def classify(
     would fail the build outright rather than ship: that is not evidence the
     tests would have caught it, and folding it into ``killed`` would flatter the
     suite.
+
+    ``downstream`` names the tests that sit on models downstream of the mutated
+    one. A catch only by those is ``caught_downstream``, not ``killed``: the
+    defect could not ship, but the model's own suite still missed it, and the
+    per-model score has to keep saying so.
     """
 
     if not run:
@@ -829,18 +874,110 @@ def classify(
     if missing:
         return Verdict(outcome="not_run")
 
+    below = set(downstream)
     caught = [n for n in passing if run[n] in {"fail", "warn"}]
+    own = sorted(n for n in caught if n not in below)
+    further = sorted(n for n in caught if n in below)
     errored = [n for n in passing if run[n] == "error"]
-    if caught:
-        warned = set(warn_severity)
+    warned = set(warn_severity)
+    if own:
         return Verdict(
             outcome="killed",
-            caught_by=sorted(caught),
-            warn_only=all(run[n] == "warn" or n in warned for n in caught),
+            caught_by=own,
+            warn_only=all(run[n] == "warn" or n in warned for n in own),
+            caught_downstream=further,
+        )
+    if further:
+        return Verdict(
+            outcome="caught_downstream",
+            warn_only=all(run[n] == "warn" or n in warned for n in further),
+            caught_downstream=further,
         )
     if errored:
         return Verdict(outcome="rejected", caught_by=sorted(errored))
     return Verdict(outcome="survived")
+
+
+def downstream_closure(
+    manifest: dict,
+    unique_id: str,
+    *,
+    cap: int = MAX_DOWNSTREAM_MODELS,
+) -> DownstreamClosure:
+    """The models downstream of ``unique_id`` a mutant can be routed through.
+
+    Breadth first over the manifest's ``child_map``, nearest first and by name
+    within one distance, so the cap keeps the models one hop away before any two
+    hops away. A model qualifies when dex can make it ephemeral in the copy the
+    way it makes the mutant ephemeral: a SQL model of this project with no
+    ``sql_header``. Anything else (a snapshot, a Python model, a package's
+    model) stops the walk on that branch and is named, because what it reads
+    is its relation in the warehouse rather than the mutant, and so is
+    everything below it. A model reached by two paths is visited once.
+    """
+
+    nodes = manifest.get("nodes") or {}
+    children = manifest.get("child_map") or {}
+    project = (manifest.get("metadata") or {}).get("project_name")
+    closure = DownstreamClosure()
+    seen = {unique_id}
+    frontier = [unique_id]
+    while frontier:
+        reached = sorted(
+            {
+                child
+                for parent in frontier
+                for child in children.get(parent, [])
+                if child not in seen and str(child).startswith(("model.", "snapshot."))
+            },
+            key=lambda uid: ((nodes.get(uid) or {}).get("name") or "", uid),
+        )
+        seen.update(reached)
+        frontier = []
+        for uid in reached:
+            node = nodes.get(uid) or {}
+            reason = _not_routable(node, project)
+            if reason is None and len(closure.eligible) >= cap:
+                closure.elided += 1
+                reason = f"beyond the cap of {cap} downstream models, nearest first"
+            if reason is not None:
+                closure.cut.append(
+                    {
+                        "unique_id": uid,
+                        "name": node.get("name") or uid,
+                        "reason": reason,
+                    }
+                )
+                continue
+            closure.eligible.append(uid)
+            frontier.append(uid)
+    return closure
+
+
+def _not_routable(node: dict, project: str | None) -> str | None:
+    """Why a downstream node cannot carry the mutant, or ``None`` if it can."""
+
+    if node.get("resource_type") != "model":
+        return (
+            "it is a snapshot, a table in the warehouse, so its tests read that "
+            "table rather than the mutant"
+        )
+    if node.get("language") == "python":
+        return (
+            "it is a Python model, which cannot be made ephemeral, so the "
+            "mutant cannot pass through it"
+        )
+    if project is not None and node.get("package_name") != project:
+        return (
+            "it belongs to an installed package, and dex does not rewrite a "
+            "package's models"
+        )
+    if (node.get("config") or {}).get("sql_header"):
+        return (
+            "it declares a sql_header, which only a materialization emits, so "
+            "it cannot run ephemeral as written"
+        )
+    return None
 
 
 def suggested_test(operator: str, equivalence: str | None = None) -> str:

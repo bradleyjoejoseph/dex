@@ -588,6 +588,101 @@ def test_no_time_spine_warning_when_the_project_has_one(
     assert not any("time spine" in w for w in envelope["warnings"])
 
 
+# --- cumulative period_agg (#730) --------------------------------------------
+
+_PERIOD_AGG_WARNING = (
+    "metric 'stars_from_history' is cumulative with no period_agg; MetricFlow "
+    "defaults to 'first', so at week or month grain it reports each period's "
+    "first day, not its last. Set period_agg: last for a running total."
+)
+
+_CUMULATIVE_YAML = """\
+semantic_models:
+  - name: repo_history
+    description: Daily star counts.
+    model: ref('stg_customers')
+    defaults:
+      agg_time_dimension: signup_date
+    entities:
+      - name: repo
+        type: primary
+        expr: id
+    dimensions:
+      - name: signup_date
+        type: time
+        expr: cast('2020-01-01' as date)
+        type_params:
+          time_granularity: day
+    measures:
+      - name: stars
+        agg: sum
+        expr: id
+
+metrics:
+  - name: stars_from_history
+    label: Stars from history
+    type: cumulative
+    type_params:
+      measure: stars
+      cumulative_type_params:
+        grain_to_date: month
+{period_agg}  - name: star_events
+    label: Star events
+    type: simple
+    type_params:
+      measure: stars
+"""
+
+
+def _cumulative_yaml(*, period_agg: str | None) -> str:
+    line = f"        period_agg: {period_agg}\n" if period_agg is not None else ""
+    return _CUMULATIVE_YAML.format(period_agg=line)
+
+
+def _author_semantic(tmp_path: Path, capsys, content: str, mode: str) -> dict:
+    payload = _payload_file(tmp_path, content, name=f"{mode}-stars.json")
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "semantic",
+            mode,
+            "stars",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    return envelope
+
+
+def test_cumulative_metric_without_period_agg_warns(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """plan and define share `_semantic_plan`, so both name the default."""
+
+    content = _cumulative_yaml(period_agg=None)
+    for mode in ("plan", "define"):
+        envelope = _author_semantic(tmp_path, capsys, content, mode)
+        assert envelope["status"] == "ok"
+        assert _PERIOD_AGG_WARNING in envelope["warnings"]
+        assert not any(
+            "star_events" in warning and "period_agg" in warning
+            for warning in envelope["warnings"]
+        )
+
+
+def test_period_agg_set_and_a_simple_metric_do_not_warn(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    content = _cumulative_yaml(period_agg="last")
+    for mode in ("plan", "define"):
+        envelope = _author_semantic(tmp_path, capsys, content, mode)
+        assert envelope["status"] == "ok"
+        assert not any("period_agg" in warning for warning in envelope["warnings"])
+
+
 # --- the unchanged class (#109) ----------------------------------------------
 
 
@@ -894,6 +989,175 @@ def test_definition_edit_finds_the_file_that_already_declares_the_name(
     assert rc == 0, envelope
     assert envelope["data"]["paths"] == ["models/semantic/customers.yml"]
     assert envelope["data"]["updated"] == ["doubled"]
+
+
+_TRIPLED = {
+    "kind": "metric",
+    "content": (
+        "name: tripled\n"
+        "label: Tripled\n"
+        "type: derived\n"
+        "type_params:\n"
+        "  expr: customer_count * 3\n"
+        "  metrics:\n"
+        "    - name: customer_count\n"
+    ),
+}
+_NO_PATH_REFUSAL = (
+    "metric 'tripled' is not in the project, so there is no file to rewrite: "
+    "give it a path"
+)
+
+
+def test_a_new_definition_defaults_to_the_only_file_of_its_kind(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """#738: one file declares every metric and semantic model, so a new one
+    with no path has exactly one place to go, and the plan says it went there."""
+
+    _land_baseline(tmp_path, capsys, _COMMENTED_YAML)
+    orders = {
+        "kind": "semantic_model",
+        "content": (
+            "name: orders\n"
+            "model: ref('stg_customers')\n"
+            "entities:\n"
+            "  - name: customer_order\n"
+            "    type: primary\n"
+            "    expr: id\n"
+        ),
+    }
+    rc, envelope = _plan_definitions(tmp_path, capsys, [_TRIPLED, orders], "new.json")
+    assert rc == 0, envelope
+    assert envelope["data"]["paths"] == ["models/semantic/customers.yml"]
+    assert sorted(envelope["data"]["defined"]) == ["orders", "tripled"]
+    assert (
+        "metric 'tripled' placed in models/semantic/customers.yml, the project's "
+        "only file that declares metrics"
+    ) in envelope["warnings"]
+    assert (
+        "semantic_model 'orders' placed in models/semantic/customers.yml, the "
+        "project's only file that declares semantic models"
+    ) in envelope["warnings"]
+    assert "+  - name: tripled" in envelope["diffs"][0]["unified"]
+
+
+def test_a_new_definition_follows_its_own_kind_not_any_semantic_file(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """Semantic models in one file and metrics in another: two semantic files,
+    but only one declares metrics, so a new metric still has one home."""
+
+    _land_baseline(tmp_path, capsys, _COMMENTED_YAML)
+    (dbt_project_dir / "models" / "semantic" / "more_models.yml").write_text(
+        "semantic_models:\n"
+        "  - name: accounts\n"
+        "    model: ref('stg_customers')\n"
+        "    entities:\n"
+        "      - name: account\n"
+        "        type: primary\n"
+        "        expr: id\n",
+        encoding="utf-8",
+    )
+    rc, envelope = _plan_definitions(tmp_path, capsys, [_TRIPLED], "split.json")
+    assert rc == 0, envelope
+    assert envelope["data"]["paths"] == ["models/semantic/customers.yml"]
+    assert envelope["data"]["defined"] == ["tripled"]
+    assert any(
+        w.startswith("metric 'tripled' placed in models/semantic/customers.yml")
+        for w in envelope["warnings"]
+    )
+
+
+def test_a_first_metric_defaults_to_the_only_semantic_file(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """No metric exists yet, but one file declares every semantic model, so the
+    project's first metric has one place to go."""
+
+    models_only = _VALID_SEMANTIC_YAML.split("\nmetrics:\n")[0] + "\n"
+    _land_baseline(tmp_path, capsys, models_only)
+    first = {
+        "kind": "metric",
+        "content": (
+            "name: customers_total\n"
+            "label: Customers total\n"
+            "type: simple\n"
+            "type_params:\n"
+            "  measure: customer_count\n"
+        ),
+    }
+    rc, envelope = _plan_definitions(tmp_path, capsys, [first], "first.json")
+    assert rc == 0, envelope
+    assert envelope["data"]["paths"] == ["models/semantic/customers.yml"]
+    assert envelope["data"]["defined"] == ["customers_total"]
+    assert (
+        "metric 'customers_total' placed in models/semantic/customers.yml, the "
+        "project's only semantic file"
+    ) in envelope["warnings"]
+
+
+def test_a_first_metric_with_two_semantic_files_is_still_refused(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """No metric exists yet and two files declare semantic models, so the first
+    metric has no single file to default to."""
+
+    models_only = _VALID_SEMANTIC_YAML.split("\nmetrics:\n")[0] + "\n"
+    _land_baseline(tmp_path, capsys, models_only)
+    (dbt_project_dir / "models" / "semantic" / "more_models.yml").write_text(
+        "semantic_models:\n"
+        "  - name: accounts\n"
+        "    model: ref('stg_customers')\n"
+        "    entities:\n"
+        "      - name: account\n"
+        "        type: primary\n"
+        "        expr: id\n",
+        encoding="utf-8",
+    )
+    first = {
+        "kind": "metric",
+        "content": (
+            "name: customers_total\n"
+            "label: Customers total\n"
+            "type: simple\n"
+            "type_params:\n"
+            "  measure: customer_count\n"
+        ),
+    }
+    rc, envelope = _plan_definitions(tmp_path, capsys, [first], "first.json")
+    assert rc == 1
+    assert envelope["errors"] == [
+        "metric 'customers_total' is not in the project, so there is no file to "
+        "rewrite: give it a path"
+    ]
+
+
+def test_a_new_definition_with_two_files_of_its_kind_is_still_refused(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    _land_baseline(tmp_path, capsys, _COMMENTED_YAML)
+    (dbt_project_dir / "models" / "semantic" / "more_metrics.yml").write_text(
+        "metrics:\n"
+        "  - name: quadrupled\n"
+        "    type: derived\n"
+        "    type_params:\n"
+        "      expr: customer_count * 4\n"
+        "      metrics:\n"
+        "        - name: customer_count\n",
+        encoding="utf-8",
+    )
+    rc, envelope = _plan_definitions(tmp_path, capsys, [_TRIPLED], "two.json")
+    assert rc == 1
+    assert envelope["errors"] == [_NO_PATH_REFUSAL]
+
+
+def test_a_new_definition_with_no_file_of_its_kind_is_still_refused(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    rc, envelope = _plan_definitions(tmp_path, capsys, [_TRIPLED], "none.json")
+    assert rc == 1
+    assert envelope["errors"] == [_NO_PATH_REFUSAL]
 
 
 def test_definition_edit_drops_a_note_about_a_line_it_removed(
@@ -1595,8 +1859,10 @@ def test_validate_semantic_yaml_falls_back_to_structural_check(monkeypatch):
     parsed = yaml.safe_load(_VALID_SEMANTIC_YAML)
     warnings = validate_semantic_yaml("models/semantic/customers.yml", parsed)
     assert warnings == [
-        "metricflow_semantic_interfaces is not installed (install the "
-        "[semantic] extra); semantic YAML got a structural check only"
+        "metricflow is not installed (neither metricflow_semantic_interfaces "
+        "nor dbt_semantic_interfaces could be imported); semantic YAML got a "
+        "structural check only. Install the 'semantic' extra "
+        "(exmergo-dex-core[semantic]) to validate against MetricFlow's schemas."
     ]
 
     no_model = yaml.safe_load("semantic_models:\n  - name: customers\n")

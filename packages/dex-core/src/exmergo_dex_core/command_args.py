@@ -434,10 +434,15 @@ def phase_handshake(
             and gate.session_spent is not None
             and gate.session_ceiling - gate.session_spent < exc.cost.estimate
         ):
+            cap = gate.session_ceiling_cap
             extra_notes.append(
                 "the session budget is the binding ceiling; raising --budget "
                 "alone will not unlock this, raise the session budget in "
                 ".dex/config.yml instead"
+                if cap is None or gate.session_ceiling < cap.value
+                else f"the session budget is the binding ceiling, and it is "
+                f"{cap.named()}: neither --budget nor .dex/config.yml can raise "
+                "it, only the host can"
             )
         if extra_notes:
             data["notes"] = [*data.get("notes", []), *extra_notes]

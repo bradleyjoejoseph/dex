@@ -548,10 +548,13 @@ dex maintain grain
 
 > [high] (order_id, product_id) on dex_demo.main.order_items is no longer
 > unique: 13952 distinct combinations over 14000 rows (~48 duplicate rows);
-> joins on it will fan out
+> no known join uses it
 
 The declared composite reached the grain channel, was measured as a composite,
-and the warehouse disagreed with it. It is a finding, never an automatic
+and the warehouse disagreed with it. No join uses this key: the declared join
+into `order_items` matches on `(order_id, order_item_id)`. When a join does use
+the key, the finding says joins on it will fan out and lists them in
+`data.joins`. It is a finding, never an automatic
 rewrite. On DuckDB this is free; on a metered warehouse it goes through the same
 `--confirm --budget` handshake every scanning command does.
 

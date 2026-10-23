@@ -150,6 +150,8 @@ def propagate(
     edits = builder.edits() + list(extra_edits or [])
     if new is None:
         _refuse_surviving_reads(view, kind, old, edits)
+    else:
+        _refuse_surviving_python_readers(view, kind, old, edits)
     verb = "rename" if new is not None else "remove"
     target = f"{kind} {old}" + (f" to {new}" if new else "")
     return Propagation(
@@ -172,7 +174,59 @@ _READING_FORMS = {
     "macro": ("macro_call", "yaml_test_ref"),
     "source": ("source_call", "semantic_model_ref", "yaml_relationship_to"),
 }
-_NODE_READING_FORMS = ("ref_call", "semantic_model_ref", "yaml_relationship_to")
+_NODE_READING_FORMS = (
+    "ref_call",
+    "semantic_model_ref",
+    "yaml_relationship_to",
+    "python_ref",
+    "python_source",
+    "yaml_snapshot_relation",
+)
+
+
+def _project_after_edits(view: DbtProjectView, edits: list[PlanEdit]) -> DbtProjectView:
+    """Project state after ``edits``, including Python models from disk.
+
+    ``load()`` leaves ``.py`` out of ``view.files``. Rename/remove guards need
+    those files in the overlay so :class:`~..references.ReferenceIndex` can
+    honor in-memory deletes and rewrites instead of re-reading the on-disk file.
+    """
+
+    from pathlib import Path as _Path
+
+    from ..dbt_project import SourceFile, content_hash
+
+    deleted = {edit.path for edit in edits if edit.op is EditOp.DELETE}
+    surviving: dict[str, str] = {}
+    root = _Path(view.root)
+    for model_path in view.model_paths:
+        base = root / model_path
+        if not base.is_dir():
+            continue
+        for python in base.rglob("*.py"):
+            rel = python.relative_to(root).as_posix()
+            if rel in deleted:
+                continue
+            try:
+                surviving[rel] = python.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                continue
+    for path, source in view.files.items():
+        if path not in deleted:
+            surviving[path] = source.content
+    for edit in edits:
+        if edit.op is EditOp.UPSERT and edit.new_content is not None:
+            surviving[edit.path] = edit.new_content
+    return view.model_copy(
+        update={
+            "files": {
+                path: SourceFile(
+                    path=path, content=content, sha256=content_hash(content)
+                )
+                for path, content in surviving.items()
+            }
+        }
+    )
 
 
 def _refuse_surviving_reads(
@@ -187,28 +241,7 @@ def _refuse_surviving_reads(
     at.
     """
 
-    from ..dbt_project import SourceFile, content_hash
-
-    deleted = {edit.path for edit in edits if edit.op is EditOp.DELETE}
-    surviving = {
-        path: source.content
-        for path, source in view.files.items()
-        if path not in deleted
-    }
-    for edit in edits:
-        if edit.op is EditOp.UPSERT and edit.new_content is not None:
-            surviving[edit.path] = edit.new_content
-
-    after = view.model_copy(
-        update={
-            "files": {
-                path: SourceFile(
-                    path=path, content=content, sha256=content_hash(content)
-                )
-                for path, content in surviving.items()
-            }
-        }
-    )
+    after = _project_after_edits(view, edits)
     index = ReferenceIndex(after, scan_packages=False)
     forms = _READING_FORMS.get(kind, _NODE_READING_FORMS)
     kinds = _FILE_NODES if kind in _FILE_NODES else (kind,)
@@ -229,6 +262,38 @@ def _refuse_surviving_reads(
         "block, unguard it, substitute a value). Author those edits and pass "
         "them with --edits-file, and they will be checked and stored in this "
         "same plan"
+    )
+
+
+def _refuse_surviving_python_readers(
+    view: DbtProjectView, kind: str, name: str, edits: list[PlanEdit]
+) -> None:
+    """Refuse a rename that would leave a Python reader on the old name.
+
+    dex does not rewrite Python models. A rename that moves the SQL and YAML
+    side and leaves ``dbt.ref(...)`` / ``dbt.source(...)`` behind is the partial
+    change #657 documents; the caller must update or remove those readers in the
+    same plan (``--edits-file``) before the rename can proceed.
+    """
+
+    after = _project_after_edits(view, edits)
+    index = ReferenceIndex(after, scan_packages=False)
+    kinds = _FILE_NODES if kind in _FILE_NODES else (kind,)
+    forms = ("python_ref", "python_source")
+    hits = [
+        hit
+        for candidate in kinds
+        for hit in index.references_to(name, candidate)[0]
+        if hit.form in forms
+    ]
+    if not hits:
+        return
+    where = sorted(f"{hit.path}:{hit.line}" for hit in hits)
+    raise PropagationRefusedError(
+        f"renaming the {kind} '{name}' would leave {len(where)} Python "
+        f"reader(s) on the old name: {', '.join(where)}. dex does not rewrite "
+        "Python models; update or remove those calls (for example with "
+        "--edits-file) and re-run"
     )
 
 
@@ -436,7 +501,9 @@ class _Builder:
             if self.new is not None:
                 result = rename_column_in_sql(content, path, column, self.new)
             elif node == self.owner:
-                result = unproject_column_in_sql(content, path, column)
+                result = unproject_column_in_sql(
+                    content, path, column, through_ctes=True
+                )
             else:
                 # A downstream model reading a removed column is a read the caller
                 # has to decide about, not one dex removes. `_refuse_reads` names

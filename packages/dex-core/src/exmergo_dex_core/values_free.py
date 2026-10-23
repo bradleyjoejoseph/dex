@@ -130,6 +130,34 @@ CALLER_ONLY_MESSAGE = (
     "no effect here"
 )
 
+# The same rule for the host's cap on the daily spend ceiling (#787), which a
+# file might be expected to carry at the top level or beside the ceiling it
+# caps. Keyed by dotted path, so a nested key is named as precisely as a
+# top-level one.
+SESSION_CEILING_CAP_MESSAGE = (
+    "is set by the host (DEX_SESSION_CEILING_CAP or "
+    "DexEngine(session_ceiling_cap=...)) and never read from the repository, so it "
+    "has no effect here"
+)
+CALLER_ONLY_SETTINGS: dict[str, str] = {
+    **dict.fromkeys(CALLER_ONLY_KEYS, CALLER_ONLY_MESSAGE),
+    "session_ceiling_cap": SESSION_CEILING_CAP_MESSAGE,
+    "budget.session_ceiling_cap": SESSION_CEILING_CAP_MESSAGE,
+}
+
+
+def caller_only_message(path: str) -> str | None:
+    """Why the setting at dotted ``path`` cannot live in ``.dex/config.yml``, or
+    None when it can. A key beneath a caller-only one is caller-only too."""
+
+    parts = path.split(".")
+    for depth in range(1, len(parts) + 1):
+        message = CALLER_ONLY_SETTINGS.get(".".join(parts[:depth]))
+        if message is not None:
+            return message
+    return None
+
+
 # The column-profile fields that hold a value read from a table, and so are
 # absent from a profile produced in the mode and from any cache entry it wrote.
 COLUMN_VALUE_FIELDS: tuple[str, ...] = ("min_value", "max_value", "value_domain")

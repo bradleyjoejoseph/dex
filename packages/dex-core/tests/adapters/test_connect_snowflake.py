@@ -1565,3 +1565,29 @@ def test_changing_the_dev_target_forgets_what_was_listed(multi_db_connection):
     assert "RAW.STAGING.SEEDS" in _scoped_identifiers(adapter)
     adapter.read_dev_target(None)
     assert _scoped_identifiers(adapter) == ["RAW.PUBLIC.EVENTS"]
+
+
+def test_a_host_cap_binds_over_a_higher_committed_session_ceiling(fake_sf_connection):
+    """#787: the cap is folded in where every gate is built, so a Snowflake
+    command whose file allows the day far more still meets the host's bound."""
+
+    from exmergo_dex_core.config import Budget, DexConfig
+    from exmergo_dex_core.connect import new_cost_gate
+    from exmergo_dex_core.session_cap import SessionCeilingCap
+    from exmergo_dex_core.storage import MemoryStore
+
+    config = DexConfig(
+        connector="snowflake",
+        budget=Budget(ceiling=600.0, session_ceiling=1_000_000.0),
+    ).with_session_ceiling_cap(SessionCeilingCap(0.5, "environment"))
+    adapter = make_adapter(fake_sf_connection)
+    adapter.cost_gate = new_cost_gate(
+        "snowflake", config, MemoryStore(), confirmed=True, command="explore query"
+    )
+    with pytest.raises(OverCeilingError, match=r"DEX_SESSION_CEILING_CAP=0\.5"):
+        adapter.run_query(
+            'SELECT COUNT(*) FROM "SHOP"."PUBLIC"."CUSTOMERS"',
+            max_rows=10,
+            timeout_seconds=30,
+        )
+    assert data_statements(fake_sf_connection) == []

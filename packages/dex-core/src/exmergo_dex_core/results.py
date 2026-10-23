@@ -119,6 +119,9 @@ class Result(BaseModel):
     # Which mode produced this result (#591). A host that requires values-free
     # results asserts it here, and the envelope states it as `data.result_mode`.
     result_mode: ResultMode = ResultMode.FULL
+    # The host's cap on the daily ceiling (#787), as `{value, unit, source}`,
+    # stamped by the engine on every result while one is set; None otherwise.
+    session_ceiling_cap: dict[str, Any] | None = None
 
     def data(self) -> dict[str, Any]:
         """The command-specific payload, keyed as the command contract documents."""
@@ -158,6 +161,8 @@ def to_envelope(result: Result, *, hints: dict[str, Any] | None = None) -> env.E
     # Stated only in the mode, so a full-mode payload is exactly what it was.
     if result.result_mode is ResultMode.VALUES_FREE:
         data["result_mode"] = result.result_mode.value
+    if result.session_ceiling_cap is not None:
+        data["session_ceiling_cap"] = result.session_ceiling_cap
 
     if result.pending_confirmation is not None and result.pending_offer is not None:
         raise ValueError(

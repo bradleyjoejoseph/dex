@@ -51,6 +51,21 @@ def test_the_three_wrappers_stay_byte_identical():
     assert len(contents) == 1, [path.as_posix() for path in WRAPPERS]
 
 
+def test_the_bundled_engine_builds_at_the_pinned_version(wrapper):
+    """The installed plugin builds `packages/dex-core` from a directory with no
+    .git, so hatch-vcs reports its fallback_version, and that is the version every
+    `.dex/` stamp the plugin writes carries. A fallback that drifted from the pin
+    is #731's `tool_version: 0.0.0`, or a wrong release, in every cache."""
+
+    import tomllib
+
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    options = tomllib.loads(pyproject.read_text(encoding="utf-8"))["tool"]["hatch"][
+        "version"
+    ]["raw-options"]
+    assert options["fallback_version"] == wrapper.DEX_CORE_VERSION
+
+
 def test_the_wrapper_knows_every_engine_connector(wrapper):
     """An engine connector the wrapper does not name falls back to the DuckDB
     extra, so the installed engine lacks the client and refuses every command for
@@ -71,7 +86,10 @@ def test_the_wrapper_knows_every_engine_connector(wrapper):
         (["transform", "plan", "add a model"], []),
         (["maintain", "schema"], []),
         (["maintain", "reconcile"], []),
-        # dbt semantic authoring takes MetricFlow schema validation (#639).
+        # dbt semantic authoring reads no Ossie document, but it validates
+        # against MetricFlow's schemas, so it takes the `semantic` extra
+        # -- see issue 639: without it the validation degrades to a
+        # structural check.
         (["semantic", "define", "--edits-file", "edits.json"], ["semantic"]),
         (["semantic", "update", "--edits-file", "edits.json"], ["semantic"]),
         (["semantic", "plan", "--edits-file", "edits.json"], ["semantic"]),
@@ -136,6 +154,15 @@ def test_every_ossie_reading_command_takes_the_ossie_extra(wrapper):
     for group, subcommand in wrapper._OSSIE_READING_COMMANDS:
         argv = ["--connector", "snowflake", group, subcommand, "--repo-root", "."]
         assert "ossie" in wrapper._feature_extras(argv), (group, subcommand)
+
+
+def test_every_semantic_authoring_command_takes_the_semantic_extra(wrapper):
+    """Structural: the table in the wrapper is the claim, and each row of it
+    resolves to the extra whatever flags surround the command (#639)."""
+
+    for group, subcommand in wrapper._SEMANTIC_AUTHORING_COMMANDS:
+        argv = ["--connector", "snowflake", group, subcommand, "--edits-file", "e.json"]
+        assert "semantic" in wrapper._feature_extras(argv), (group, subcommand)
 
 
 def test_the_extras_are_the_connector_plus_whatever_the_command_needs(

@@ -324,6 +324,12 @@ no free count, every relation verified is a count query.
 Survivors are not yet compared with the model on the dev data here, so each
 reports `equivalence.status: not_checked` with the reason.
 
+With `--downstream`, the tests of the models that read the mutated one run
+against each mutant too, routed through those models as ephemeral, so nothing
+is materialized there either. It is opt-in here because each downstream test
+recomputes the chain beneath it, and it is priced into the same single estimate:
+each mutant's line grows by the downstream tests it will run.
+
 The shipped `unpivot_json_object` macro has a Trino implementation that casts the
 object to `map(varchar, json)` and unnests it, so it is top-level only and keeps
 nested values as JSON, matching the other adapters.

@@ -23,8 +23,11 @@ that it is visible while the caller can still act on it.
 
 from __future__ import annotations
 
+import ast
+import datetime
+import math
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -179,13 +182,24 @@ def cache_resolver(cache: DexCache | None, dialect: str) -> Resolver:
     return resolve
 
 
-def render_model_sql(sql: str, resolve: Resolver) -> str:
+_MISSING = object()
+_SCALAR_TYPES = (str, int, float, bool, datetime.date, datetime.datetime)
+
+
+def render_model_sql(
+    sql: str,
+    resolve: Resolver,
+    vars: Mapping[str, Any] | None = None,
+) -> str:
     """A dbt model reduced to plain SQL over relations ``resolve`` can name.
 
-    A ``{{ config() }}`` header is dropped. Every other jinja construct raises
-    :class:`UnattributableError`: a macro call or an ``{% if %}`` means the rendered
-    shape is not the shape dex can see, and guessing at it would attribute a
-    delta to a statement the warehouse never runs.
+    A ``{{ config() }}`` header is dropped, and a ``{{ var('name') }}`` or
+    ``{{ var('name', default) }}`` call resolves to a SQL scalar literal when
+    ``vars`` (or the literal second argument) carries a scalar value for it.
+    Every other jinja construct raises :class:`UnattributableError`: a macro
+    call or an ``{% if %}`` means the rendered shape is not the shape dex can
+    see, and guessing at it would attribute a delta to a statement the warehouse
+    never runs.
 
     The scan is :func:`~..dbt_project.jinja_regions`; the refusals are this
     function's own. The reference index reads the same regions and reports what
@@ -209,6 +223,15 @@ def render_model_sql(sql: str, resolve: Resolver) -> str:
         call = next((c for c in region.calls if c.spans_region), None)
         if call is not None and call.callee == "config":
             continue
+        if call is not None and call.callee == "var":
+            rendered.append(
+                _render_var(
+                    region.body.strip(),
+                    vars,
+                    inside_quotes=_inside_single_quotes("".join(rendered)),
+                )
+            )
+            continue
         if call is None or call.callee not in {"ref", "source"}:
             raise UnattributableError(
                 f"the model calls {{{{ {_clip(region.body.strip())} }}}}, which "
@@ -219,7 +242,7 @@ def render_model_sql(sql: str, resolve: Resolver) -> str:
         # non-literal there (`ref(var('x'))`) is a name only dbt knows, and
         # resolving the var's own argument instead would silently attribute the
         # delta to whichever relation that string happens to name.
-        if not call.args or call.args[-1] is None:
+        if not call.args or call.args[-1] is None or None in call.args:
             raise UnattributableError(
                 f"could not read a relation name out of "
                 f"{{{{ {_clip(region.body.strip())} }}}}"
@@ -233,6 +256,122 @@ def render_model_sql(sql: str, resolve: Resolver) -> str:
             "the model is entirely jinja; there is no SQL to compare"
         )
     return joined
+
+
+def _render_var(
+    body: str,
+    vars: Mapping[str, Any] | None,
+    *,
+    inside_quotes: bool,
+) -> str:
+    parsed = _parse_var_call(body)
+    if parsed is None:
+        raise UnattributableError(
+            f"the model calls {{{{ {_clip(body)} }}}}, which "
+            "only dbt can render; dex cannot isolate a change against it"
+        )
+    name, default = parsed
+    if vars is not None and name in vars:
+        value = vars[name]
+    elif default is not _MISSING:
+        value = default
+    else:
+        raise UnattributableError(
+            f"the model calls {{{{ {_clip(body)} }}}}, which "
+            "only dbt can render; dex cannot isolate a change against it"
+        )
+    if not isinstance(value, _SCALAR_TYPES) or (
+        isinstance(value, float) and not math.isfinite(value)
+    ):
+        raise UnattributableError(
+            f"the model calls {{{{ {_clip(body)} }}}}, which "
+            "only dbt can render; dex cannot isolate a change against it"
+        )
+    if isinstance(value, (datetime.date, datetime.datetime)):
+        escaped = value.isoformat().replace("'", "''")
+        return escaped if inside_quotes else f"'{escaped}'"
+    if isinstance(value, str):
+        escaped = value.replace("'", "''")
+        return escaped if inside_quotes else f"'{escaped}'"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    return str(value)
+
+
+def _parse_var_call(body: str) -> tuple[str, Any] | None:
+    try:
+        tree = ast.parse(body, mode="eval")
+    except SyntaxError:
+        return None
+    node = tree.body
+    if not isinstance(node, ast.Call):
+        return None
+    if not (isinstance(node.func, ast.Name) and node.func.id == "var"):
+        return None
+    if not node.args or len(node.args) > 2:
+        return None
+    first = node.args[0]
+    if not (isinstance(first, ast.Constant) and isinstance(first.value, str)):
+        return None
+    if len(node.args) == 1 and not node.keywords:
+        return first.value, _MISSING
+    if len(node.args) == 2 and not node.keywords:
+        return first.value, _ast_scalar(node.args[1])
+    if (
+        len(node.args) == 1
+        and len(node.keywords) == 1
+        and node.keywords[0].arg == "default"
+    ):
+        return first.value, _ast_scalar(node.keywords[0].value)
+    return None
+
+
+def _ast_scalar(node: ast.AST) -> Any:
+    if isinstance(node, ast.Constant) and isinstance(node.value, _SCALAR_TYPES):
+        return node.value
+    if isinstance(node, ast.Name) and node.id in {"true", "false"}:
+        return node.id == "true"
+    if (
+        isinstance(node, ast.UnaryOp)
+        and isinstance(node.op, (ast.USub, ast.UAdd))
+        and isinstance(node.operand, ast.Constant)
+        and isinstance(node.operand.value, (int, float))
+        and not isinstance(node.operand.value, bool)
+    ):
+        return (
+            -node.operand.value if isinstance(node.op, ast.USub) else node.operand.value
+        )
+    return _MISSING
+
+
+def _inside_single_quotes(sql_prefix: str) -> bool:
+    """Whether ``sql_prefix`` ends inside an unclosed SQL single-quoted literal."""
+
+    in_single = False
+    in_double = False
+    index = 0
+    length = len(sql_prefix)
+    while index < length:
+        char = sql_prefix[index]
+        if not in_single and not in_double:
+            if sql_prefix.startswith("--", index):
+                newline = sql_prefix.find("\n", index + 2)
+                if newline == -1:
+                    break
+                index = newline + 1
+                continue
+            if sql_prefix.startswith("/*", index):
+                close = sql_prefix.find("*/", index + 2)
+                if close == -1:
+                    break
+                index = close + 2
+                continue
+        if char == "'" and not in_double:
+            in_single = not in_single
+        elif char == '"' and not in_single:
+            in_double = not in_double
+        index += 1
+    return in_single
 
 
 def _clip(text: str, limit: int = 60) -> str:
@@ -766,7 +905,12 @@ def attribute(
         if current is None:
             continue  # authoring a model that does not exist yet has no prior
         model = _prepare(
-            edit.path, current.content, edit.new_content, resolver, dialect
+            edit.path,
+            current.content,
+            edit.new_content,
+            resolver,
+            dialect,
+            view.vars,
         )
         if model is not None:
             models.append(model)
@@ -815,7 +959,12 @@ def attribute(
 
 
 def _prepare(
-    path: str, prior_sql: str, authored_sql: str, resolve: Resolver, dialect: str
+    path: str,
+    prior_sql: str,
+    authored_sql: str,
+    resolve: Resolver,
+    dialect: str,
+    vars: Mapping[str, Any] | None = None,
 ) -> _Model | None:
     """Render both versions, classify their difference, and keep the trees.
 
@@ -834,13 +983,13 @@ def _prepare(
     record = ModelAttribution(path=path)
     degraded: str | None = None
     try:
-        prior = render_model_sql(prior_sql, resolve)
-        authored = render_model_sql(authored_sql, resolve)
+        prior = render_model_sql(prior_sql, resolve, vars)
+        authored = render_model_sql(authored_sql, resolve, vars)
     except UnattributableError as exc:
         degraded = str(exc)
         try:
-            prior = render_model_sql(prior_sql, naming_resolver)
-            authored = render_model_sql(authored_sql, naming_resolver)
+            prior = render_model_sql(prior_sql, naming_resolver, vars)
+            authored = render_model_sql(authored_sql, naming_resolver, vars)
         except UnattributableError as bare:
             if prior_sql.strip() == authored_sql.strip():
                 return None
