@@ -1746,7 +1746,9 @@ def main(argv: list[str] | None = None) -> int:
     # collect; an engine that never got this far (construction itself refused)
     # has nothing to carry.
     if engine is not None and engine.connection_warnings:
-        envelope.warnings = list(engine.connection_warnings) + list(envelope.warnings)
+        envelope.warnings = [
+            w for w in engine.connection_warnings if w not in envelope.warnings
+        ] + list(envelope.warnings)
 
     # What the config file says that no command refuses (a key the schema does
     # not know, a key written twice) rides out on every envelope the same way,
@@ -1772,10 +1774,14 @@ def main(argv: list[str] | None = None) -> int:
     # the write happened before the command did, so even a command that failed
     # afterwards has to report it or the file changed with nothing saying so.
     if engine is not None and engine.config_diffs:
-        envelope.diffs = list(engine.config_diffs) + list(envelope.diffs)
+        envelope.diffs = [
+            d for d in engine.config_diffs if d not in envelope.diffs
+        ] + list(envelope.diffs)
     # And what a host's cap made of that amendment (#787): written, but moot.
     if engine is not None and engine.budget_warnings:
-        envelope.warnings = list(engine.budget_warnings) + list(envelope.warnings)
+        envelope.warnings = [
+            w for w in engine.budget_warnings if w not in envelope.warnings
+        ] + list(envelope.warnings)
 
     # Every command runs against a connector or against none, so every envelope
     # can name the paradigm a later billed command would spend in. Filled only

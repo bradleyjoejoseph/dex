@@ -18,7 +18,13 @@ import pytest
 
 from exmergo_dex_core import command_args
 from exmergo_dex_core.cli import main
-from exmergo_dex_core.config import Budget, DexConfig, load_config, save_config
+from exmergo_dex_core.config import (
+    Budget,
+    DexConfig,
+    DuckDBTarget,
+    load_config,
+    save_config,
+)
 from exmergo_dex_core.config_commands import config_set, config_unset
 from exmergo_dex_core.config_document import ConfigDocument
 from exmergo_dex_core.connect import new_cost_gate
@@ -446,3 +452,61 @@ def test_an_uncapped_library_result_carries_no_cap(duckdb_file: Path):
 def test_a_malformed_library_cap_refuses_at_construction():
     with pytest.raises(ConfigurationError, match="session_ceiling_cap"):
         DexEngine(connector="duckdb", session_ceiling_cap=0)
+
+
+def test_a_library_engine_carries_config_diff_and_cap_warning_on_first_result(
+    tmp_path: Path, duckdb_file: Path
+):
+    save_config(
+        DexConfig(
+            connector="duckdb",
+            duckdb=DuckDBTarget(path=str(duckdb_file)),
+            budget=Budget(ceiling=HUGE),
+        ),
+        tmp_path,
+    )
+    engine = DexEngine.from_repo(
+        tmp_path, session_ceiling=HUGE, session_ceiling_cap=CAP
+    )
+    assert engine.config_diffs
+    assert engine.budget_warnings
+
+    first = engine.connect_test()
+    assert first.diffs == engine.config_diffs
+    assert any(MOOT in w for w in first.warnings)
+    first_envelope = to_envelope(first)
+    assert first_envelope.diffs == engine.config_diffs
+    assert any(MOOT in w for w in first_envelope.warnings)
+
+    second = engine.connect_test()
+    assert second.diffs == []
+    assert not any(MOOT in w for w in second.warnings)
+    second_envelope = to_envelope(second)
+    assert second_envelope.diffs == []
+    assert not any(MOOT in w for w in second_envelope.warnings)
+
+    assert engine.config_diffs
+    assert engine.budget_warnings
+
+
+def test_a_library_engine_carries_decline_diff_and_cap_warning_on_first_result(
+    tmp_path: Path, duckdb_file: Path
+):
+    save_config(
+        DexConfig(
+            connector="duckdb",
+            duckdb=DuckDBTarget(path=str(duckdb_file)),
+            budget=Budget(ceiling=HUGE),
+        ),
+        tmp_path,
+    )
+    engine = DexEngine.from_repo(
+        tmp_path, decline_session_ceiling=True, session_ceiling_cap=CAP
+    )
+    first = engine.connect_test()
+    assert first.diffs == engine.config_diffs
+    assert any(MOOT in w for w in first.warnings)
+
+    second = engine.connect_test()
+    assert second.diffs == []
+    assert not any(MOOT in w for w in second.warnings)

@@ -266,10 +266,15 @@ def test_lone_duckdb_file_in_run_directory_is_used_and_warned(tmp_path: Path):
     with DexEngine(repo_root=str(tmp_path)) as eng:
         mapped = eng.inventory()
         assert len(mapped.objects) == 1
+        assert any("lone.duckdb" in w for w in mapped.warnings)
         assert len(eng.connection_warnings) == 1
         assert "lone.duckdb" in eng.connection_warnings[0]
         assert eng.connector == "duckdb"
         assert eng.path == str(lone)
+        # A second result does not repeat the connection warning
+        mapped2 = eng.inventory()
+        assert not any("lone.duckdb" in w for w in mapped2.warnings)
+        assert len(eng.connection_warnings) == 1
 
 
 def test_two_duckdb_files_in_run_directory_still_refuses_naming_both(

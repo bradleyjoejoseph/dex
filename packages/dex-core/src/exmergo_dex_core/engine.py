@@ -269,6 +269,9 @@ class DexEngine:
         # What the cap made of a write this engine performed, phrased for an
         # envelope; read back into every one, as `config_diffs` is.
         self.budget_warnings: list[str] = []
+        self._emitted_config_diffs: int = 0
+        self._emitted_budget_warnings: int = 0
+        self._emitted_connection_warnings: int = 0
         self._adapter_instance: Adapter | None = None
         # The dev namespace the last command's adapter was told to read, kept
         # only so provenance can show it; `_adapter` is what sets and clears it.
@@ -1786,16 +1789,34 @@ def _refused_in_values_free(name: str, method: Any) -> Any:
 
 
 def _reports_session_cap(method: Any) -> Any:
-    """Stamp a host's cap onto every result a public method returns (#787), so
-    a host can assert it on the library the way it asserts ``result_mode``."""
+    """Stamp a host's cap and fold pending diffs and warnings onto every result
+    a public method returns (#787, #789), so a library caller receives them
+    on the first result that leaves the engine."""
 
     @functools.wraps(method)
     def stamped(self: DexEngine, *args: Any, **kwargs: Any) -> Any:
         result = method(self, *args, **kwargs)
-        if self.session_ceiling_cap is not None and isinstance(result, Result):
-            result.session_ceiling_cap = self.session_ceiling_cap.payload(
-                result.cost.unit
+        if isinstance(result, Result):
+            if self.session_ceiling_cap is not None:
+                result.session_ceiling_cap = self.session_ceiling_cap.payload(
+                    result.cost.unit
+                )
+            emitted_diffs = getattr(self, "_emitted_config_diffs", 0)
+            unemitted_diffs = self.config_diffs[emitted_diffs:]
+            if unemitted_diffs:
+                result.diffs = list(unemitted_diffs) + list(result.diffs)
+                self._emitted_config_diffs = len(self.config_diffs)
+
+            emitted_budget = getattr(self, "_emitted_budget_warnings", 0)
+            emitted_conn = getattr(self, "_emitted_connection_warnings", 0)
+            unemitted_warnings = (
+                self.budget_warnings[emitted_budget:]
+                + self.connection_warnings[emitted_conn:]
             )
+            if unemitted_warnings:
+                result.warnings = list(unemitted_warnings) + list(result.warnings)
+                self._emitted_budget_warnings = len(self.budget_warnings)
+                self._emitted_connection_warnings = len(self.connection_warnings)
         return result
 
     return stamped
