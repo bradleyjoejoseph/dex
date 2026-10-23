@@ -913,7 +913,12 @@ def _install_fake_pricing(
         adapter.describe_estimate = describe
     if translate is not None:
         adapter.compute_spend_translation = translate
-    monkeypatch.setattr(DexEngine, "_adapter", lambda self, command=None, **kw: adapter)
+
+    def _fake_adapter(self, command=None, **kw):
+        self._adapter_instance = adapter
+        return adapter
+
+    monkeypatch.setattr(DexEngine, "_adapter", _fake_adapter)
     monkeypatch.setattr(
         build_module,
         "compile_estimate",
@@ -1588,6 +1593,230 @@ def test_a_build_whose_statements_reported_no_billing_figure_says_so(
     # A build's per-paradigm notes ride in `warnings`, where its cap note does.
     assert any("no billing figure" in w for w in envelope["warnings"])
     assert not (tmp_path / ".dex" / "spend.jsonl").exists()
+
+
+def test_engine_settled_spend_reports_unknown_settlement_on_failed_build(
+    bigquery_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """Issue #584: after a build on a connector whose dbt adapter reports no
+    billing figure raises after running statements, settled_spend() reports
+    unknown_settlement: true and settled: false."""
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.transform.commands import BuildFailedError
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=5_000_000.0,
+        per_node={"stg_customers": 5_000_000.0},
+        confirmed=True,
+        ceiling=100_000_000,
+    )
+    run_results = json.dumps(
+        {
+            "results": [
+                {
+                    "unique_id": "model.dex_test.stg_customers",
+                    "status": "error",
+                    "execution_time": 1.0,
+                    "adapter_response": {},
+                    "message": "compilation or execution error",
+                }
+            ]
+        }
+    )
+    _fake_runner_factory(
+        monkeypatch,
+        returncode=1,
+        run_results_json=(
+            bigquery_project_dir / "target" / "run_results.json",
+            run_results,
+        ),
+    )
+    engine = DexEngine(
+        repo_root=tmp_path,
+        connector="bigquery",
+        confirmed=True,
+        budget=100_000_000,
+    )
+    with pytest.raises(BuildFailedError):
+        engine.build(target="dev")
+
+    spend = engine.settled_spend()
+    assert spend is not None
+    assert spend["unknown_settlement"] is True
+    assert spend["settled"] is False
+    assert spend["bytes_billed"] is None
+
+
+def test_engine_settled_spend_returns_none_after_refusal_before_first_statement(
+    bigquery_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """Issue #584: after a refusal that stopped before the first statement,
+    settled_spend() returns None (nothing was billed)."""
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.guards.cost_guard import ConfirmationRequiredError
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=5_000_000.0,
+        per_node={"stg_customers": 5_000_000.0},
+        confirmed=False,
+        ceiling=100_000_000,
+    )
+    engine = DexEngine(
+        repo_root=tmp_path,
+        connector="bigquery",
+        confirmed=False,
+        budget=100_000_000,
+    )
+    with pytest.raises(ConfirmationRequiredError):
+        engine.build(target="dev")
+
+    assert engine.settled_spend() is None
+
+
+def test_engine_settled_spend_reports_unknown_settlement_on_successful_build(
+    bigquery_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """Issue #584: when a build succeeds on an adapter reporting no billing figure,
+    settled_spend() returns the build's spend with unknown_settlement: true."""
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.envelope import Paradigm
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=5_000_000.0,
+        per_node={"stg_customers": 5_000_000.0},
+        confirmed=True,
+        ceiling=100_000_000,
+    )
+    run_results = json.dumps(
+        {
+            "results": [
+                {
+                    "unique_id": "model.dex_test.stg_customers",
+                    "status": "success",
+                    "execution_time": 1.0,
+                    "adapter_response": {},
+                }
+            ]
+        }
+    )
+    _fake_runner_factory(
+        monkeypatch,
+        returncode=0,
+        run_results_json=(
+            bigquery_project_dir / "target" / "run_results.json",
+            run_results,
+        ),
+    )
+    engine = DexEngine(
+        repo_root=tmp_path,
+        connector="bigquery",
+        confirmed=True,
+        budget=100_000_000,
+    )
+    res = engine.build(target="dev")
+    assert res.spend["unknown_settlement"] is True
+
+    spend = engine.settled_spend()
+    assert spend is not None
+    assert spend["unknown_settlement"] is True
+    assert spend["settled"] is False
+    assert spend["bytes_billed"] is None
+
+
+def test_engine_settled_spend_reflects_build_known_spend_on_success_and_failure(
+    bigquery_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """Issue #584: when a build reports a known billing figure, settled_spend()
+    reports the build's spend on both success and failure."""
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.transform.commands import BuildFailedError
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=5_000_000.0,
+        per_node={"stg_customers": 5_000_000.0},
+        confirmed=True,
+        ceiling=100_000_000,
+    )
+    # 1. Success case
+    run_results_success = json.dumps(
+        {
+            "results": [
+                {
+                    "unique_id": "model.dex_test.stg_customers",
+                    "status": "success",
+                    "execution_time": 1.0,
+                    "adapter_response": {"bytes_billed": 7500},
+                }
+            ]
+        }
+    )
+    _fake_runner_factory(
+        monkeypatch,
+        returncode=0,
+        run_results_json=(
+            bigquery_project_dir / "target" / "run_results.json",
+            run_results_success,
+        ),
+    )
+    engine = DexEngine(
+        repo_root=tmp_path,
+        connector="bigquery",
+        confirmed=True,
+        budget=100_000_000,
+    )
+    res = engine.build(target="dev")
+    assert res.spend["bytes_billed"] == 7500.0
+    spend = engine.settled_spend()
+    assert spend is not None
+    assert spend["bytes_billed"] == 7500.0
+    assert spend["settled"] is True
+    assert spend["unknown_settlement"] is False
+
+    # 2. Failure case
+    run_results_failure = json.dumps(
+        {
+            "results": [
+                {
+                    "unique_id": "model.dex_test.stg_customers",
+                    "status": "error",
+                    "execution_time": 1.0,
+                    "adapter_response": {"bytes_billed": 3200},
+                    "message": "compilation error",
+                }
+            ]
+        }
+    )
+    _fake_runner_factory(
+        monkeypatch,
+        returncode=1,
+        run_results_json=(
+            bigquery_project_dir / "target" / "run_results.json",
+            run_results_failure,
+        ),
+    )
+    with pytest.raises(BuildFailedError):
+        engine.build(target="dev")
+
+    spend_fail = engine.settled_spend()
+    assert spend_fail is not None
+    assert spend_fail["bytes_billed"] == 3200.0
+    assert spend_fail["settled"] is True
+    assert spend_fail["unknown_settlement"] is False
 
 
 def test_billed_build_failure_names_the_real_error_in_errors(

@@ -270,6 +270,7 @@ class DexEngine:
         # envelope; read back into every one, as `config_diffs` is.
         self.budget_warnings: list[str] = []
         self._adapter_instance: Adapter | None = None
+        self._last_spend: dict[str, Any] | None = None
         # The dev namespace the last command's adapter was told to read, kept
         # only so provenance can show it; `_adapter` is what sets and clears it.
         self._dev_target_read: str | None = None
@@ -424,6 +425,7 @@ class DexEngine:
 
         budget = self.budget if budget is None else budget
         confirmed = self.confirmed if confirmed is None else confirmed
+        self._last_spend = None
 
         if self._adapter_instance is None:
             # Resolved first, as its own statement: it may auto-detect a
@@ -778,6 +780,16 @@ class DexEngine:
 
         from .guards.cost_guard import spend_field
 
+        spend = self._last_spend
+        if spend is not None:
+            if spend.get("unknown_settlement") or spend.get("settled") is False:
+                return spend
+            paradigm = self.paradigm
+            field = spend_field(paradigm) if paradigm is not None else None
+            if field is not None and not spend.get(field):
+                return None
+            return spend
+
         adapter = self._adapter_instance
         gate = None if adapter is None else command_args.cost_gate(adapter)
         if adapter is None or gate is None:
@@ -787,7 +799,11 @@ class DexEngine:
         # first statement is free, and a spend block of zeroes on it would read
         # as a claim about money where the honest answer is silence. The day's
         # cumulative total rides along only when this command contributed to it.
-        if not spend or not spend.get(spend_field(gate.paradigm)):
+        if not spend:
+            return None
+        if spend.get("unknown_settlement") or spend.get("settled") is False:
+            return spend
+        if not spend.get(spend_field(gate.paradigm)):
             return None
         return spend
 
@@ -1561,6 +1577,7 @@ class DexEngine:
         from .transform import commands as transform
         from .transform.build import DependencyPolicy
 
+        self._last_spend = None
         return transform.build(
             self,
             target=target,

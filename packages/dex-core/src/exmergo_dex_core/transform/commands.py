@@ -1018,6 +1018,7 @@ def test_mutations(
     from . import mutation as mutation_mod
     from .build import ShadowRun, assert_dev_target
 
+    engine._last_spend = None
     if not model:
         raise ValueError(
             "transform test needs a model: `transform test --mutate <model>`"
@@ -1176,6 +1177,7 @@ def test_mutations(
             # total read during the loop counts that reservation on top of what
             # the runs actually billed and overstates the day by the estimate.
             spend = _refresh_session_total(spend, gate, store, paradigm, connector)
+            engine._last_spend = spend
     finally:
         if gate is not None:
             gate.settle()
@@ -2944,6 +2946,7 @@ def build(
         build as run_build,
     )
 
+    engine._last_spend = None
     store = engine.store
     config = engine.config
     repo_root = engine.require_repo_root("building the dbt project")
@@ -2998,6 +3001,7 @@ def build(
                 engine, project, target, select, for_plan, for_plan_document
             ),
             decisions=_built_decisions(engine, summary),
+            engine=engine,
         )
 
     dev_warnings = dev_check()
@@ -3102,6 +3106,7 @@ def build(
         ),
         decisions=decisions,
         uncapped=bool(dev_target.missing_cap_references(project, target, connector)),
+        engine=engine,
     )
 
 
@@ -3833,6 +3838,7 @@ def _shape_build_result(
     verification: BuildVerification | None = None,
     decisions: list[dict[str, Any]] | None = None,
     uncapped: bool = False,
+    engine: DexEngine | None = None,
 ) -> BuildResult:
     """Shape a finished dbt run per paradigm, and ledger what it actually cost.
 
@@ -3915,6 +3921,8 @@ def _shape_build_result(
         reservation_id=gate.reservation_id if gate is not None else None,
         uncapped=uncapped,
     )
+    if engine is not None:
+        engine._last_spend = spend
     notes = [
         *notes,
         *uptime_notes,
