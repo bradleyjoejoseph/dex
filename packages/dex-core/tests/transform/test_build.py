@@ -169,11 +169,12 @@ def test_non_dev_target_is_refused(
 def _fake_runner_factory(
     monkeypatch,
     *,
-    returncode: int,
+    returncode: int = 0,
     stdout: str = "",
     stderr: str = "",
     run_results_json: tuple[Path, str] | None = None,
     on_run=None,
+    raise_exc: Exception | None = None,
 ):
     """Replace _default_runner with a recorder returning a canned dbt result.
 
@@ -202,6 +203,8 @@ def _fake_runner_factory(
                 path, content = run_results_json
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(content, encoding="utf-8")
+            if raise_exc is not None:
+                raise raise_exc
             return subprocess.CompletedProcess(
                 args=argv, returncode=returncode, stdout=stdout, stderr=stderr
             )
@@ -1817,6 +1820,113 @@ def test_engine_settled_spend_reflects_build_known_spend_on_success_and_failure(
     assert spend_fail["bytes_billed"] == 3200.0
     assert spend_fail["settled"] is True
     assert spend_fail["unknown_settlement"] is False
+
+
+def test_build_timeout_after_running_nodes_ledgers_their_seconds(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """Issue #667: when a dbt build times out after running statements, the seconds
+    already spent are read from run_results.json and ledgered, and settled_spend()
+    reflects them rather than treating the run as free."""
+    import subprocess
+
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.envelope import Paradigm
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="databricks",
+        paradigm=Paradigm.COMPUTE_TIME,
+        estimate=60.0,
+        per_node={"stg_customers": 60.0},
+        confirmed=True,
+        ceiling=3600,
+    )
+    run_results = json.dumps(
+        {
+            "elapsed_time": 10.0,
+            "results": [
+                {
+                    "unique_id": "model.dex_test.stg_customers",
+                    "status": "success",
+                    "execution_time": 10.0,
+                    "adapter_response": {},
+                }
+            ],
+        }
+    )
+    _fake_runner_factory(
+        monkeypatch,
+        raise_exc=subprocess.TimeoutExpired(cmd=["dbt", "build"], timeout=30),
+        run_results_json=(
+            dbt_project_dir / "target" / "run_results.json",
+            run_results,
+        ),
+    )
+    engine = DexEngine(
+        repo_root=tmp_path,
+        connector="databricks",
+        confirmed=True,
+        budget=3600,
+    )
+    with pytest.raises(subprocess.TimeoutExpired):
+        engine.build(target="dev")
+
+    spend = engine.settled_spend()
+    assert spend is not None
+    assert spend["seconds_billed"] == 10.0
+    assert spend["settled"] is True
+    assert spend["unknown_settlement"] is False
+
+    entries = engine.store.spend_entries()
+    settlement_entries = [
+        e
+        for e in entries
+        if e.get("entry") == "settlement" and e.get("command") == "transform build"
+    ]
+    assert len(settlement_entries) == 1
+    assert settlement_entries[0]["billed_seconds"] == 10.0
+
+
+def test_build_raising_with_no_artifact_reports_unknown_settlement(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """Issue #667: when a dbt build raises without writing run_results.json,
+    settled_spend() reports unknown_settlement: true and settled: false."""
+    import subprocess
+
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.envelope import Paradigm
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="databricks",
+        paradigm=Paradigm.COMPUTE_TIME,
+        estimate=60.0,
+        per_node={"stg_customers": 60.0},
+        confirmed=True,
+        ceiling=3600,
+    )
+    _fake_runner_factory(
+        monkeypatch,
+        raise_exc=subprocess.TimeoutExpired(cmd=["dbt", "build"], timeout=30),
+        run_results_json=None,
+    )
+    engine = DexEngine(
+        repo_root=tmp_path,
+        connector="databricks",
+        confirmed=True,
+        budget=3600,
+    )
+    with pytest.raises(subprocess.TimeoutExpired):
+        engine.build(target="dev")
+
+    spend = engine.settled_spend()
+    assert spend is not None
+    assert spend["seconds_billed"] is None
+    assert spend["settled"] is False
+    assert spend["unknown_settlement"] is True
+    assert engine.store.spend_entries() == []
 
 
 def test_billed_build_failure_names_the_real_error_in_errors(
@@ -3514,6 +3624,8 @@ def _snowflake_build(
     auto_suspend: int | None = 60,
     others_running: int = 0,
     returncode: int = 0,
+    raise_exc: Exception | None = None,
+    write_run_results: bool = True,
 ) -> _SnowflakeBuild:
     """One project, one model, and a warehouse dbt is about to write into.
 
@@ -3644,20 +3756,25 @@ def _snowflake_build(
     dbt = _fake_runner_factory(
         monkeypatch,
         returncode=returncode,
+        raise_exc=raise_exc,
         run_results_json=(
-            target / "run_results.json",
-            json.dumps(
-                {
-                    "elapsed_time": 4.0,
-                    "results": [
-                        {
-                            "unique_id": _SF_MODEL,
-                            "status": "success" if returncode == 0 else "error",
-                            "execution_time": 1.5,
-                        }
-                    ],
-                }
-            ),
+            (
+                target / "run_results.json",
+                json.dumps(
+                    {
+                        "elapsed_time": 4.0,
+                        "results": [
+                            {
+                                "unique_id": _SF_MODEL,
+                                "status": "success" if returncode == 0 else "error",
+                                "execution_time": 1.5,
+                            }
+                        ],
+                    }
+                ),
+            )
+            if write_run_results
+            else None
         ),
         on_run=dbt_writes,
     )
@@ -3948,6 +4065,124 @@ def test_a_dev_target_covered_by_the_allowlist_is_judged_on_a_first_build(
         f["code"] for f in envelope["data"]["verification"]["findings"]
     ]
     assert envelope["connection"]["target"]["databases"] == ["RAW.PUBLIC", "DEV"]
+
+
+def test_snowflake_build_timeout_settles_uptime_and_nodes(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """Issue #667: when a dbt build times out on Snowflake after running statements,
+    its execution time is observed in the warehouse uptime model, settled alongside
+    uptime overhead (resume minimum + auto-suspend tail), and ledgered."""
+    import subprocess
+
+    from exmergo_dex_core.config import load_config
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.storage import FilesystemStore
+
+    run = _snowflake_build(
+        monkeypatch,
+        dbt_project_dir,
+        tmp_path,
+        built_rows=4,
+        raise_exc=subprocess.TimeoutExpired(cmd=["dbt", "build"], timeout=30),
+    )
+    engine = DexEngine(
+        repo_root=tmp_path,
+        config=load_config(tmp_path),
+        store=FilesystemStore(tmp_path),
+        connector="snowflake",
+        confirmed=True,
+        budget=3600,
+    )
+    with pytest.raises(subprocess.TimeoutExpired):
+        engine.build(target="dev")
+
+    spend = engine.settled_spend()
+    assert spend is not None
+    assert spend["seconds_billed"] == 64.0
+    assert spend["settled"] is True
+    assert spend["unknown_settlement"] is False
+
+    # 1.5s statement time + 62.5s overhead (auto-suspend tail) = 64.0s
+    assert _settled_seconds(run.ledger) == 64.0
+
+
+def test_snowflake_build_timeout_with_no_artifact_reports_unknown_settlement(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """Issue #667: when a dbt build times out on Snowflake before writing
+    run_results.json, settled_spend() reports unknown_settlement: true and
+    settled: false."""
+    import subprocess
+
+    from exmergo_dex_core.config import load_config
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.storage import FilesystemStore
+
+    run = _snowflake_build(
+        monkeypatch,
+        dbt_project_dir,
+        tmp_path,
+        built_rows=4,
+        write_run_results=False,
+        raise_exc=subprocess.TimeoutExpired(cmd=["dbt", "build"], timeout=30),
+    )
+    engine = DexEngine(
+        repo_root=tmp_path,
+        config=load_config(tmp_path),
+        store=FilesystemStore(tmp_path),
+        connector="snowflake",
+        confirmed=True,
+        budget=3600,
+    )
+    with pytest.raises(subprocess.TimeoutExpired):
+        engine.build(target="dev")
+
+    spend = engine.settled_spend()
+    assert spend is not None
+    assert spend["seconds_billed"] is None
+    assert spend["settled"] is False
+    assert spend["unknown_settlement"] is True
+    assert not run.ledger.exists() or _settled_seconds(run.ledger) == 0.0
+
+
+def test_cli_build_timeout_populates_envelope_spend(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Issue #667: when transform build times out from the CLI, the error envelope
+    carries data.spend with the partial settled spend or unknown_settlement."""
+    import subprocess
+
+    # 1. With run_results: carries settled spend
+    _snowflake_build(
+        monkeypatch,
+        dbt_project_dir,
+        tmp_path,
+        built_rows=4,
+        raise_exc=subprocess.TimeoutExpired(cmd=["dbt", "build"], timeout=30),
+    )
+    rc, envelope = _sf_build_verify(tmp_path, capsys)
+    assert rc != 0
+    assert envelope["status"] == "error"
+    assert envelope["data"]["spend"]["seconds_billed"] == 64.0
+    assert envelope["data"]["spend"]["settled"] is True
+    assert envelope["data"]["spend"]["unknown_settlement"] is False
+
+    # 2. Without run_results: carries unknown_settlement
+    _snowflake_build(
+        monkeypatch,
+        dbt_project_dir,
+        tmp_path,
+        built_rows=4,
+        write_run_results=False,
+        raise_exc=subprocess.TimeoutExpired(cmd=["dbt", "build"], timeout=30),
+    )
+    rc, envelope = _sf_build_verify(tmp_path, capsys)
+    assert rc != 0
+    assert envelope["status"] == "error"
+    assert envelope["data"]["spend"]["seconds_billed"] is None
+    assert envelope["data"]["spend"]["settled"] is False
+    assert envelope["data"]["spend"]["unknown_settlement"] is True
 
 
 def test_a_verified_build_whose_dev_dataset_was_never_created_says_so(

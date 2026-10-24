@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -3066,6 +3067,19 @@ def build(
             ],
         )
         raise
+    except Exception:
+        with contextlib.suppress(Exception):
+            _settle_raised_build_spend(
+                engine,
+                project,
+                target,
+                paradigm=paradigm,
+                connector=connector,
+                store=store,
+                estimate=estimate,
+                adapter=adapter,
+            )
+        raise
 
     # dbt ran its statements outside the adapter, so the uptime model is told
     # what they were before anything else runs on the warehouse: the
@@ -3634,6 +3648,101 @@ def _settle_dbt_spend(
             reservation_id=reservation_id,
         )
     return spend, notes
+
+
+def _settle_raised_build_spend(
+    engine: DexEngine,
+    project: Path,
+    target: str,
+    *,
+    paradigm,
+    connector: str,
+    store: Store,
+    estimate: float | None,
+    adapter=None,
+) -> None:
+    """Settle spend and warehouse uptime when a billed dbt run raises.
+
+    When dbt dies mid-run (for instance on a subprocess timeout), any statements
+    it executed before dying ran outside the adapter and their execution time is
+    read from whatever partial target/run_results.json it wrote. If an artifact
+    was written with executed nodes, those seconds are ledgered against the
+    daily ceiling and observed in the warehouse uptime model. If no artifact was
+    written (or no nodes ran), the gate's reservation is released and the run
+    reports unknown_settlement: true so the caller knows spend occurred but the
+    amount cannot be determined.
+    """
+
+    from . import dev_target
+
+    gate = command_args.cost_gate(adapter) if adapter is not None else None
+    uptime = getattr(adapter, "warehouse_uptime", None)
+    run_results_path = project / "target" / "run_results.json"
+    summary: dict[str, Any] | None = None
+
+    if run_results_path.is_file():
+        try:
+            from .build import _summarize
+
+            completed = subprocess.CompletedProcess(
+                args=[], returncode=1, stdout="", stderr=""
+            )
+            summary = _summarize(project, target, completed)
+        except Exception:
+            summary = None
+
+    forget = getattr(adapter, "forget_metadata", None)
+    if forget is not None:
+        with contextlib.suppress(Exception):
+            forget()
+
+    if summary and summary.get("nodes"):
+        exec_seconds = _execution_seconds(summary)
+        if uptime is not None and exec_seconds > 0:
+            with contextlib.suppress(Exception):
+                uptime.observe(exec_seconds, span=summary.get("elapsed_seconds"))
+        uptime_seconds, _ = uptime.settle() if uptime is not None else (0.0, [])
+        if gate is not None:
+            gate.settle()
+        gate_billed = gate.billed if gate is not None else 0.0
+
+        spend, _ = _settle_dbt_spend(
+            summary,
+            [],
+            paradigm=paradigm,
+            connector=connector,
+            store=store,
+            estimate=estimate,
+            adapter=adapter,
+            gate_billed=gate_billed,
+            uptime_seconds=uptime_seconds,
+            reservation_id=gate.reservation_id if gate is not None else None,
+            uncapped=bool(
+                dev_target.missing_cap_references(project, target, connector)
+            ),
+        )
+        if engine is not None:
+            engine._last_spend = spend
+    else:
+        if uptime is not None:
+            with contextlib.suppress(Exception):
+                uptime.settle()
+        if gate is not None:
+            gate.settle()
+        gate_billed = gate.billed if gate is not None else 0.0
+
+        spend = _record_build_spend(
+            store,
+            connector,
+            billed=None,
+            paradigm=paradigm,
+            estimate=estimate,
+            gate_billed=gate_billed,
+            command="transform build",
+            reservation_id=gate.reservation_id if gate is not None else None,
+        )
+        if engine is not None:
+            engine._last_spend = spend
 
 
 def _price_build(
