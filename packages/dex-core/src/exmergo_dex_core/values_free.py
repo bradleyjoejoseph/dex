@@ -342,7 +342,12 @@ def withhold_error(exc: BaseException) -> BaseException:
     if isinstance(exc, ValuesFreeError):
         return exc
     if isinstance(exc, WarehouseQueryError):
-        withheld = WarehouseQueryError(_WITHHELD, reading=exc.reading, stage=exc.stage)
+        withheld = WarehouseQueryError(
+            _WITHHELD,
+            reading=exc.reading,
+            stage=exc.stage,
+            authored_by=exc.authored_by,
+        )
         withheld.values_free_code = ValuesFreeCode.WAREHOUSE_REFUSED.value
         return withheld
     if isinstance(exc, DexError):

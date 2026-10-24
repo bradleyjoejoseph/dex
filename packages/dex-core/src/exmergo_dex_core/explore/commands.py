@@ -58,7 +58,12 @@ from ..config import (
     pii_override_paths,
 )
 from ..engine_version import state_version_warning
-from ..errors import DexError, PrerequisiteError, RequestError
+from ..errors import (
+    DexError,
+    PrerequisiteError,
+    RequestError,
+    WarehouseQueryError,
+)
 from ..guards.cost_guard import (
     ConfirmationRequiredError,
     CostGuardError,
@@ -1738,6 +1743,8 @@ def _execute(
         except ConfirmationRequiredError:
             raise
         except Exception as exc:
+            if isinstance(exc, WarehouseQueryError):
+                exc = exc.caller_authored()
             if isinstance(exc, OverCeilingError):
                 exc = _with_batch_shortfall(exc, shared.adapter, batch, statement)
             entry = {

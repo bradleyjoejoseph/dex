@@ -366,3 +366,59 @@ def test_the_stage_is_a_field_and_never_text():
     assert str(coded) == f"{plain} [42703]"
     assert StatementStage.PLAN == "plan"
     assert StatementStage.RUN == "run"
+
+
+# --- who authored the refused statement (#716) ------------------------------
+
+
+def test_caller_authored_refusal_says_the_statement():
+    """Statements dex builds say 'dex built'; a statement the caller authored
+    says 'the warehouse refused the statement', so an agent is not led to believe
+    dex was the author of its own SQL."""
+
+    from exmergo_dex_core import StatementStage, WarehouseQueryError
+    from exmergo_dex_core.values_free import withhold_error
+
+    dex_authored = WarehouseQueryError(
+        "Column with name missing does not exist",
+        stage=StatementStage.RUN,
+    )
+    assert dex_authored.authored_by == "dex"
+    assert str(dex_authored) == (
+        "the warehouse refused a statement dex built: "
+        "Column with name missing does not exist"
+    )
+
+    caller_authored = dex_authored.caller_authored()
+    assert caller_authored is not dex_authored
+    assert caller_authored.authored_by == "caller"
+    assert caller_authored.stage is StatementStage.RUN
+    assert str(caller_authored) == (
+        "the warehouse refused the statement: Column with name missing does not exist"
+    )
+
+    # Idempotent
+    assert caller_authored.caller_authored() is caller_authored
+
+    # Preserved through naming()
+    named = caller_authored.naming("raw_listings")
+    assert named.authored_by == "caller"
+    assert str(named) == (
+        "the warehouse refused the statement while reading raw_listings: "
+        "Column with name missing does not exist"
+    )
+
+    # Dex-authored naming() preserves authored_by="dex"
+    dex_named = dex_authored.naming("raw_listings")
+    assert dex_named.authored_by == "dex"
+    assert str(dex_named) == (
+        "the warehouse refused a statement dex built while reading raw_listings: "
+        "Column with name missing does not exist"
+    )
+
+    # Preserved through withhold_error() in values-free mode
+    withheld = withhold_error(caller_authored)
+    assert isinstance(withheld, WarehouseQueryError)
+    assert withheld.authored_by == "caller"
+    assert str(withheld).startswith("the warehouse refused the statement")
+    assert "dex built" not in str(withheld)

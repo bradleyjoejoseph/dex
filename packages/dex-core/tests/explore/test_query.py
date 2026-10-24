@@ -1144,3 +1144,41 @@ def test_arguments_and_a_file_together_are_refused(
     )
     assert payload["reason"] == "request"
     assert "not both" in payload["errors"][0]
+
+
+def test_query_on_warehouse_error_reports_warehouse_refused_the_statement(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    repo = _mapped_repo(airbnb_duckdb, tmp_path, capsys)
+    payload = _query(
+        "SELECT CAST('abc' AS INTEGER) FROM RAW_LISTINGS",
+        airbnb_duckdb,
+        repo,
+        capsys,
+        expect_error=True,
+    )
+    assert payload["reason"] == "execution_failure"
+    assert "the warehouse refused the statement:" in payload["errors"][0]
+    assert "dex built" not in payload["errors"][0]
+
+
+def test_query_batch_warehouse_error_reports_warehouse_refused_the_statement(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    repo = _mapped_repo(airbnb_duckdb, tmp_path, capsys)
+    payload = _query(
+        ["SELECT 1 AS a", "SELECT CAST('abc' AS INTEGER) FROM RAW_LISTINGS"],
+        airbnb_duckdb,
+        repo,
+        capsys,
+        expect_error=True,
+    )
+    assert payload["reason"] == "execution_failure"
+    assert "the warehouse refused the statement:" in payload["errors"][0]
+    assert "dex built" not in payload["errors"][0]
+    results = payload["data"]["results"]
+    assert results[0]["status"] == "ok"
+    assert results[1]["status"] == "failed"
+    assert results[1]["reason"] == "execution_failure"
+    assert "the warehouse refused the statement:" in results[1]["error"]
+    assert "dex built" not in results[1]["error"]

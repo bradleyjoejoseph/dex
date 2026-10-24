@@ -170,6 +170,12 @@ class WarehouseQueryError(DexError):
     later rebuild carries it (see :class:`StatementStage`). The message text is
     the same whichever door it was, so nothing a host already matches moves.
 
+    ``authored_by`` tells statements dex built (profiling, probes, rendered
+    semantic SQL) from statements the caller authored (``explore query``). When
+    set to ``"caller"``, the message says "the warehouse refused the statement"
+    rather than "a statement dex built", so an agent is not led to believe dex was
+    the author of its own SQL.
+
     It lives here rather than beside the code that raises it, which is this
     module's usual rule, because six adapters raise this one class (there is no
     "the code that raises it") and because ``envelope._reason_overrides`` has to
@@ -183,14 +189,18 @@ class WarehouseQueryError(DexError):
         *,
         reading: str | None = None,
         stage: StatementStage | None = None,
+        authored_by: str = "dex",
     ):
         self.detail = detail
         self.reading = reading
         self.stage = stage
+        self.authored_by = authored_by
         super().__init__(self._message())
 
     def _message(self) -> str:
         about = f" while reading {self.reading}" if self.reading else ""
+        if self.authored_by == "caller":
+            return f"the warehouse refused the statement{about}: {self.detail}"
         return f"the warehouse refused a statement dex built{about}: {self.detail}"
 
     def naming(self, identifier: str) -> WarehouseQueryError:
@@ -204,7 +214,30 @@ class WarehouseQueryError(DexError):
 
         if self.reading is not None:
             return self
-        return WarehouseQueryError(self.detail, reading=identifier, stage=self.stage)
+        return WarehouseQueryError(
+            self.detail,
+            reading=identifier,
+            stage=self.stage,
+            authored_by=self.authored_by,
+        )
+
+    def caller_authored(self) -> WarehouseQueryError:
+        """This failure marked as coming from caller-authored SQL.
+
+        Statements dex builds (profiling, semantic queries, probes) say "dex built";
+        a statement the agent or caller wrote with `explore query` says only "the
+        warehouse refused the statement", so the agent is not pointed at dex as the
+        author of its own SQL.
+        """
+
+        if self.authored_by == "caller":
+            return self
+        return WarehouseQueryError(
+            self.detail,
+            reading=self.reading,
+            stage=self.stage,
+            authored_by="caller",
+        )
 
 
 class NoConnectorSelectedError(ConfigurationError):
