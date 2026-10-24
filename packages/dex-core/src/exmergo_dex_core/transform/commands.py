@@ -71,6 +71,7 @@ from .results import (
 if TYPE_CHECKING:
     from ..engine import DexEngine
     from . import semantic as semantic_mod
+    from .evidence import BuildEvidence
     from .verify import BuildVerification
 
 # Two of this module's neighbours reach the dialect engine at import (`.semantic`
@@ -2696,7 +2697,7 @@ def export_plan(engine: DexEngine, plan_id: str | None = None) -> PlanExportResu
     return PlanExportResult(
         plan_id=document.plan_id,
         digest=document.digest,
-        plan=document.model_dump(mode="json"),
+        plan=document,
     )
 
 
@@ -2867,7 +2868,7 @@ def ground(engine: DexEngine, plan_id: str | None = None) -> GroundingResult:
         catalog_error=catalog_error,
         plan_digest=plan_document(stored).digest,
     )
-    return GroundingResult(plan_id=plan_id, grounding=grounding.data())
+    return GroundingResult(plan_id=plan_id, grounding=grounding)
 
 
 def cmd_ground(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
@@ -2893,7 +2894,7 @@ def classify(
     from .classify import classify_edit
 
     if edits is not None:
-        classifications = [classify_edit(edit).data() for edit in edits]
+        classifications = [classify_edit(edit) for edit in edits]
         return ClassificationResult(classifications=classifications)
 
     store, plan_id = _resolve_plan_id(engine, plan_id, "classifying a plan")
@@ -2907,7 +2908,7 @@ def classify(
         if edit.op is EditOp.DELETE and candidate.is_file():
             with contextlib.suppress(OSError, UnicodeDecodeError):
                 existing = candidate.read_text(encoding="utf-8")
-        classifications.append(classify_edit(edit, existing_content=existing).data())
+        classifications.append(classify_edit(edit, existing_content=existing))
     return ClassificationResult(plan_id=plan_id, classifications=classifications)
 
 
@@ -3844,7 +3845,7 @@ def _build_evidence(
     select: str | None,
     for_plan: str | None,
     for_plan_document: Any = None,
-) -> dict | None:
+) -> BuildEvidence | None:
     """Read dbt's artifacts and say what the build established, or nothing.
 
     ``None`` rather than a partial block wherever the evidence cannot be built,
@@ -3886,7 +3887,7 @@ def _build_evidence(
             edits=edits,
             plan_digest=plan_digest,
             source_digest=source_digest,
-        ).data()
+        )
     except Exception:
         return None
 
@@ -3902,7 +3903,7 @@ def _shape_build_result(
     session_ceiling_declined: bool = False,
     gate=None,
     adapter=None,
-    evidence: dict | None = None,
+    evidence: BuildEvidence | None = None,
     verification: BuildVerification | None = None,
     decisions: list[dict[str, Any]] | None = None,
     uncapped: bool = False,

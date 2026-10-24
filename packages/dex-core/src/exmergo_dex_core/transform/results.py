@@ -13,6 +13,10 @@ from typing import Any, ClassVar
 from pydantic import Field
 
 from ..results import Result
+from .classify import ArtifactClassification
+from .evidence import BuildEvidence
+from .grounding import Grounding
+from .portable import PortablePlan
 
 
 class InitResult(Result):
@@ -252,10 +256,24 @@ class PlanExportResult(Result):
 
     plan_id: str = ""
     digest: str = ""
-    plan: dict[str, Any] = Field(default_factory=dict)
+    plan: PortablePlan = Field(
+        default_factory=lambda: PortablePlan(
+            plan_id="", intent="", created_at="", project_dir=""
+        )
+    )
+
+    def plan_model(self) -> PortablePlan:
+        """The typed :class:`~exmergo_dex_core.transform.portable.PortablePlan`
+        model."""
+        return self.plan
 
     def data(self) -> dict[str, Any]:
-        return {"plan_id": self.plan_id, "digest": self.digest, "plan": self.plan}
+        plan_data = (
+            self.plan.data()
+            if hasattr(self.plan, "data")
+            else (self.plan.model_dump(mode="json") if self.plan is not None else {})
+        )
+        return {"plan_id": self.plan_id, "digest": self.digest, "plan": plan_data}
 
 
 class ClassificationResult(Result):
@@ -266,12 +284,21 @@ class ClassificationResult(Result):
     """
 
     plan_id: str | None = None
-    classifications: list[dict[str, Any]] = Field(default_factory=list)
+    classifications: list[ArtifactClassification] = Field(default_factory=list)
 
     always_reports_notes: ClassVar[bool] = True
 
+    def classification_models(self) -> list[ArtifactClassification]:
+        """The typed
+        :class:`~exmergo_dex_core.transform.classify.ArtifactClassification`
+        models."""
+        return self.classifications
+
     def data(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {"classifications": self.classifications}
+        classifications_data = [
+            c.data() if hasattr(c, "data") else c for c in self.classifications
+        ]
+        payload: dict[str, Any] = {"classifications": classifications_data}
         if self.plan_id is not None:
             payload = {"plan_id": self.plan_id, **payload}
         return payload
@@ -286,12 +313,21 @@ class GroundingResult(Result):
     """
 
     plan_id: str | None = None
-    grounding: dict[str, Any] = Field(default_factory=dict)
+    grounding: Grounding = Field(default_factory=Grounding)
 
     always_reports_notes: ClassVar[bool] = True
 
+    def grounding_model(self) -> Grounding:
+        """The typed :class:`~exmergo_dex_core.transform.grounding.Grounding` model."""
+        return self.grounding
+
     def data(self) -> dict[str, Any]:
-        payload = dict(self.grounding)
+        grounding_data = (
+            self.grounding.data()
+            if hasattr(self.grounding, "data")
+            else dict(self.grounding)
+        )
+        payload = dict(grounding_data)
         if self.plan_id is not None:
             payload = {"plan_id": self.plan_id, **payload}
         return payload
@@ -405,9 +441,11 @@ class BuildResult(Result):
 
     ``success`` stays dbt's process outcome, which is the right meaning for the
     command line and a poor one for a host: an empty selection exits zero.
-    ``evidence`` is the typed answer to the question ``success`` cannot be asked,
-    and it sits beside the released fields rather than replacing them, so a
-    consumer reading ``success`` or ``summary`` keeps reading what it read.
+    ``evidence`` is the typed
+    :class:`~exmergo_dex_core.transform.evidence.BuildEvidence` answer to the
+    question ``success`` cannot be asked, and it sits beside the released
+    fields rather than replacing them, so a consumer reading ``success`` or
+    ``summary`` keeps reading what it read.
 
     ``outcome`` is lifted to the top of the payload from inside ``evidence``
     because it is the one field a reader must not have to go looking for.
@@ -415,7 +453,7 @@ class BuildResult(Result):
 
     success: bool = False
     summary: dict[str, Any] = Field(default_factory=dict)
-    evidence: dict[str, Any] | None = None
+    evidence: BuildEvidence | None = None
     # What `--verify` swept and found, or the statement that it did not run.
     # Absent only when the command predates the concept; a run that declined to
     # verify still says so, because an omitted key would read as "clean".
@@ -424,13 +462,28 @@ class BuildResult(Result):
     # records them. See :attr:`PlanResult.decisions`.
     decisions: list[dict[str, Any]] | None = None
 
+    def evidence_model(self) -> BuildEvidence | None:
+        """The typed :class:`~exmergo_dex_core.transform.evidence.BuildEvidence`
+        model."""
+        return self.evidence
+
     def data(self) -> dict[str, Any]:
         payload = dict(self.summary)
         if self.evidence is not None:
+            evidence_data = (
+                self.evidence.data()
+                if hasattr(self.evidence, "data")
+                else self.evidence
+            )
+            outcome = (
+                evidence_data.get("outcome")
+                if isinstance(evidence_data, dict)
+                else getattr(self.evidence, "outcome", None)
+            )
             payload = {
-                "outcome": self.evidence.get("outcome"),
+                "outcome": outcome,
                 **payload,
-                "evidence": self.evidence,
+                "evidence": evidence_data,
             }
         if self.verification is not None:
             payload["verification"] = self.verification

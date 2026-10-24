@@ -369,3 +369,158 @@ def test_the_vectors_are_packaged_beside_the_code_that_reads_them():
     assert host.VECTORS_DIR.is_dir()
     assert host.VECTORS_DIR.parent.name == "host"
     assert any(host.VECTORS_DIR.glob("*.json"))
+
+
+def test_results_carry_typed_host_models_and_typed_accessors():
+    """Issue #579: Result objects carry typed host models and accessors."""
+    from exmergo_dex_core.transform.results import (
+        BuildResult,
+        ClassificationResult,
+        GroundingResult,
+        PlanExportResult,
+    )
+
+    plan_model = host.PortablePlan(
+        plan_id="p123",
+        intent="testing",
+        created_at="2026-01-01",
+        project_dir="analytics",
+    )
+    export_result = PlanExportResult(
+        plan_id="p123", digest="sha256:abc", plan=plan_model
+    )
+    assert isinstance(export_result.plan, host.PortablePlan)
+    assert export_result.plan_model() is plan_model
+
+    classification_model = host.ArtifactClassification(
+        path="models/test.sql", artifact_class=host.ArtifactClass.DECLARATIVE
+    )
+    class_result = ClassificationResult(
+        plan_id="p123", classifications=[classification_model]
+    )
+    assert isinstance(class_result.classifications[0], host.ArtifactClassification)
+    assert class_result.classification_models() == [classification_model]
+
+    grounding_model = host.Grounding(completeness="complete")
+    ground_result = GroundingResult(plan_id="p123", grounding=grounding_model)
+    assert isinstance(ground_result.grounding, host.Grounding)
+    assert ground_result.grounding_model() is grounding_model
+
+    evidence_model = host.BuildEvidence(outcome=host.BuildOutcome.VALIDATED)
+    build_result = BuildResult(success=True, evidence=evidence_model)
+    assert isinstance(build_result.evidence, host.BuildEvidence)
+    assert build_result.evidence_model() is evidence_model
+
+
+def test_host_models_support_backwards_compatible_subscripting():
+    """Issue #579: Host models support __getitem__, __contains__, and get()."""
+    plan = host.PortablePlan(
+        plan_id="p123",
+        intent="testing",
+        created_at="2026-01-01",
+        project_dir="analytics",
+    )
+    assert plan["plan_id"] == "p123"
+    assert "plan_id" in plan
+    assert "nonexistent" not in plan
+    assert plan.get("plan_id") == "p123"
+    assert plan.get("missing", "default") == "default"
+    with pytest.raises(KeyError):
+        _ = plan["nonexistent"]
+
+    edit = host.PortableEdit(
+        path="models/test.sql",
+        kind=host.EditKind.MODEL_SQL,
+    )
+    assert edit["path"] == "models/test.sql"
+    assert "path" in edit
+    assert "nonexistent" not in edit
+    assert edit.get("path") == "models/test.sql"
+    assert edit.get("missing", 42) == 42
+    with pytest.raises(KeyError):
+        _ = edit["nonexistent"]
+
+    classification = host.ArtifactClassification(
+        path="models/test.sql",
+        artifact_class=host.ArtifactClass.EXECUTABLE,
+    )
+    assert classification["path"] == "models/test.sql"
+    assert classification["artifact_class"] == "executable"
+    assert "artifact_class" in classification
+    assert "nonexistent" not in classification
+    assert classification.get("artifact_class") == "executable"
+    assert classification.get("missing", None) is None
+    with pytest.raises(KeyError):
+        _ = classification["nonexistent"]
+
+    grounding = host.Grounding(completeness="complete")
+    assert grounding["completeness"] == "complete"
+    assert "completeness" in grounding
+    assert "nonexistent" not in grounding
+    assert grounding.get("completeness") == "complete"
+    assert grounding.get("nonexistent", "fallback") == "fallback"
+    with pytest.raises(KeyError):
+        _ = grounding["nonexistent"]
+
+    evidence = host.BuildEvidence(outcome=host.BuildOutcome.VALIDATED)
+    assert evidence["outcome"] == "validated"
+    assert "outcome" in evidence
+    assert "nonexistent" not in evidence
+    assert evidence.get("outcome") == "validated"
+    assert evidence.get("nonexistent", "none") == "none"
+    with pytest.raises(KeyError):
+        _ = evidence["nonexistent"]
+
+
+def test_result_data_serializes_cleanly_for_cli_envelopes():
+    """Issue #579: result.data() and to_envelope() cleanly serialize models to dicts."""
+    from exmergo_dex_core.transform.results import (
+        BuildResult,
+        ClassificationResult,
+        GroundingResult,
+        PlanExportResult,
+    )
+
+    plan = host.PortablePlan(
+        plan_id="p123",
+        intent="testing",
+        created_at="2026-01-01",
+        project_dir="analytics",
+    )
+    res_export = PlanExportResult(plan_id="p123", digest="sha256:abc", plan=plan)
+    env_export = to_envelope(res_export)
+    assert env_export.status == "ok"
+    assert isinstance(env_export.data["plan"], dict)
+    assert env_export.data["plan"]["plan_id"] == "p123"
+
+    classification = host.ArtifactClassification(
+        path="models/test.sql", artifact_class=host.ArtifactClass.DECLARATIVE
+    )
+    res_class = ClassificationResult(plan_id="p123", classifications=[classification])
+    env_class = to_envelope(res_class)
+    assert env_class.status == "ok"
+    assert isinstance(env_class.data["classifications"][0], dict)
+    assert env_class.data["classifications"][0]["artifact_class"] == "declarative"
+
+    grounding = host.Grounding(completeness="complete")
+    res_ground = GroundingResult(plan_id="p123", grounding=grounding)
+    env_ground = to_envelope(res_ground)
+    assert env_ground.status == "ok"
+    assert env_ground.data["completeness"] == "complete"
+
+    evidence = host.BuildEvidence(outcome=host.BuildOutcome.VALIDATED)
+    res_build = BuildResult(success=True, evidence=evidence)
+    env_build = to_envelope(res_build)
+    assert env_build.status == "ok"
+    assert env_build.data["outcome"] == "validated"
+    assert isinstance(env_build.data["evidence"], dict)
+    assert env_build.data["evidence"]["outcome"] == "validated"
+
+
+def test_build_result_docstring_documents_typed_evidence():
+    """Issue #579: BuildResult docstring references the BuildEvidence class."""
+    from exmergo_dex_core.transform.results import BuildResult
+
+    assert ":class:`~exmergo_dex_core.transform.evidence.BuildEvidence`" in (
+        BuildResult.__doc__ or ""
+    )

@@ -166,6 +166,19 @@ class BuildEvidence(BaseModel):
     plan_drift: list[PlanDrift] = Field(default_factory=list)
     stale_artifacts: bool | None = None
 
+    def __getitem__(self, key: str) -> Any:
+        if key in type(self).model_fields:
+            return getattr(self, key)
+        raise KeyError(key)
+
+    def __contains__(self, key: object) -> bool:
+        return key in type(self).model_fields
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key in type(self).model_fields:
+            return getattr(self, key)
+        return default
+
     def data(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "outcome": self.outcome.value,

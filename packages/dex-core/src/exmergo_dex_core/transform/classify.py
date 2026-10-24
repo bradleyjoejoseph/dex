@@ -147,6 +147,19 @@ class ArtifactClassification(BaseModel):
     basis: str = "content"
     parsed: bool = False
 
+    def __getitem__(self, key: str) -> Any:
+        if key in type(self).model_fields:
+            return getattr(self, key)
+        raise KeyError(key)
+
+    def __contains__(self, key: object) -> bool:
+        return key in type(self).model_fields
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key in type(self).model_fields:
+            return getattr(self, key)
+        return default
+
     def data(self) -> dict[str, Any]:
         return {
             "path": self.path,

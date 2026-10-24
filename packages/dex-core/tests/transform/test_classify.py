@@ -16,6 +16,7 @@ from exmergo_dex_core import DexEngine
 from exmergo_dex_core.edits import Edit, EditOp
 from exmergo_dex_core.transform.classify import (
     ArtifactClass,
+    ArtifactClassification,
     classify_content,
     classify_edit,
 )
@@ -352,6 +353,8 @@ def test_classify_reads_a_stored_plan_and_an_edits_payload(dbt_project_dir: Path
         )
         by_id = engine.classify(stored.plan_id)
         assert by_id.plan_id == stored.plan_id
+        assert isinstance(by_id.classifications[0], ArtifactClassification)
+        assert by_id.classification_models() == by_id.classifications
         assert by_id.classifications[0]["artifact_class"] == "executable"
 
         # And without a plan at all, for a caller classifying before it plans.
@@ -366,4 +369,6 @@ def test_classify_reads_a_stored_plan_and_an_edits_payload(dbt_project_dir: Path
             ]
         )
         assert "plan_id" not in ad_hoc.data()
+        assert isinstance(ad_hoc.classifications[0], ArtifactClassification)
+        assert ad_hoc.classification_models() == ad_hoc.classifications
         assert ad_hoc.classifications[0]["artifact_class"] == "declarative"

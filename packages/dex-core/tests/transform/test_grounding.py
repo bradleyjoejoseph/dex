@@ -16,6 +16,7 @@ from conftest import write_manifest, write_semantic_manifest
 from exmergo_dex_core import DexEngine
 from exmergo_dex_core.edits import EditOp
 from exmergo_dex_core.transform.grounding import (
+    Grounding,
     config_digest,
     ground_plan,
     packages_digest,
@@ -59,6 +60,11 @@ def test_a_fully_resolved_plan_reports_complete_with_no_limits(project_with_pare
     stored = _plan(
         project_with_parents, "a mart", [_model("models/staging/mart.sql", MART)]
     )
+    with DexEngine.from_repo(str(project_with_parents)) as engine:
+        ground_res = engine.ground(stored.plan_id)
+        assert isinstance(ground_res.grounding, Grounding)
+        assert ground_res.grounding_model() is ground_res.grounding
+        assert ground_res.grounding["completeness"] == "complete"
     grounding = _ground(project_with_parents, stored.plan_id)
 
     assert grounding["completeness"] == "complete"

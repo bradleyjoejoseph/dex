@@ -27,9 +27,11 @@ from exmergo_dex_core import (
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.edits import EditOp, content_hash
 from exmergo_dex_core.storage import FilesystemStore
+from exmergo_dex_core.transform.classify import ArtifactClassification
 from exmergo_dex_core.transform.plans import EditKind, PlanEdit
 from exmergo_dex_core.transform.portable import (
     PLAN_DOCUMENT_SCHEMA_VERSION,
+    PortableEdit,
     PortablePlan,
     plan_digest,
     verify_plan_document,
@@ -87,17 +89,20 @@ def _second_checkout(
 def test_the_document_carries_the_plan_and_not_a_summary(authored):
     _repo, plan_id, document, digest = authored
 
+    assert isinstance(document, PortablePlan)
     assert document["plan_id"] == plan_id
     assert document["schema_version"] == PLAN_DOCUMENT_SCHEMA_VERSION
     assert document["digest"] == digest
     # Every field the reproduction had to read out of `.dex/plans/<id>.json`.
     edit = next(e for e in document["edits"] if e["path"] == "models/staging/mart.sql")
+    assert isinstance(edit, PortableEdit)
     assert edit["op"] == "upsert"
     assert edit["kind"] == "model_sql"
     assert edit["new_content"] == MART
     assert edit["new_content_hash"] == content_hash(MART)
     # A create pins no preimage, and that is a fact the applying side checks.
     assert edit["old_content_hash"] is None
+    assert isinstance(edit.classification, ArtifactClassification)
     assert edit["classification"]["artifact_class"] == "executable"
 
 
@@ -110,6 +115,8 @@ def test_the_same_plan_exports_identically_from_two_checkouts(authored, tmp_path
         again = engine.export_plan(plan_id)
 
     assert again.digest == digest
+    assert isinstance(again.plan, PortablePlan)
+    assert again.plan_model() is again.plan
     # Byte-identical, not merely equivalent: a host comparing two exports must
     # not have to know which fields are incidental.
     assert again.plan == document
@@ -135,7 +142,7 @@ def test_a_plan_applies_in_a_checkout_that_has_no_plan_store(authored, tmp_path)
 def test_tampered_content_is_refused_and_nothing_is_written(authored, tmp_path):
     repo, _plan_id, document, digest = authored
     target = _second_checkout(repo, tmp_path, "tampered")
-    doc = json.loads(json.dumps(document))
+    doc = json.loads(json.dumps(document.data()))
     doc["edits"][0]["new_content"] += "\n-- added after authoring\n"
 
     with (
@@ -163,7 +170,7 @@ def test_a_repinned_digest_is_caught_by_the_digest_the_caller_carried(
 
     repo, _plan_id, document, digest = authored
     target = _second_checkout(repo, tmp_path, "repinned")
-    doc = json.loads(json.dumps(document))
+    doc = json.loads(json.dumps(document.data()))
     doc["edits"][0]["new_content"] += "\n-- added after authoring\n"
     doc["edits"][0]["new_content_hash"] = content_hash(doc["edits"][0]["new_content"])
     doc["digest"] = plan_digest(PortablePlan.model_validate(doc))
@@ -186,7 +193,7 @@ def test_a_changed_preimage_conflicts_rather_than_overwriting(authored, tmp_path
     original = existing.read_text()
     existing.write_text(original + "\n-- a human edited this here\n")
 
-    doc = json.loads(json.dumps(document))
+    doc = json.loads(json.dumps(document.data()))
     doc["edits"].append(
         {
             "path": "models/staging/stg_customers.sql",
@@ -223,7 +230,7 @@ def test_an_unreadable_document_refuses_rather_than_applying_part_of_it(
 
 def test_a_schema_version_this_engine_does_not_read_refuses_by_name(authored):
     _repo, _plan_id, document, _digest = authored
-    doc = json.loads(json.dumps(document))
+    doc = json.loads(json.dumps(document.data()))
     doc["schema_version"] = PLAN_DOCUMENT_SCHEMA_VERSION + 1
 
     with pytest.raises(PlanDocumentError, match="schema_version"):
@@ -276,7 +283,7 @@ def test_an_edit_outside_this_checkouts_surface_is_refused_not_written(
 
     repo, _plan_id, document, _digest = authored
     target = _second_checkout(repo, tmp_path, "escape")
-    doc = json.loads(json.dumps(document))
+    doc = json.loads(json.dumps(document.data()))
     doc["edits"] = [
         {
             "path": "../../etc/dex_was_here",
@@ -299,7 +306,7 @@ def test_a_kind_that_disagrees_with_its_location_is_refused_in_the_second_checko
 ):
     repo, _plan_id, document, _digest = authored
     target = _second_checkout(repo, tmp_path, "misfiled")
-    doc = json.loads(json.dumps(document))
+    doc = json.loads(json.dumps(document.data()))
     doc["edits"] = [
         {
             # A macro filed under the model paths: dbt would parse it as a model.
@@ -374,7 +381,7 @@ def test_a_delete_carries_no_content_and_says_so(dbt_project_dir: Path):
 
 def test_a_delete_carrying_content_is_refused(authored):
     _repo, _plan_id, document, _digest = authored
-    doc = json.loads(json.dumps(document))
+    doc = json.loads(json.dumps(document.data()))
     doc["edits"][0]["op"] = "delete"
     with pytest.raises(PlanDocumentError, match="carry no content"):
         verify_plan_document(doc)
@@ -389,7 +396,7 @@ def test_the_digest_ignores_when_the_plan_was_made(authored):
     """
 
     _repo, _plan_id, document, digest = authored
-    doc = json.loads(json.dumps(document))
+    doc = json.loads(json.dumps(document.data()))
     doc["created_at"] = "2020-01-01T00:00:00+00:00"
     doc["engine_version"] = "0.0.0-something-else"
     assert plan_digest(PortablePlan.model_validate(doc)) == digest
@@ -480,14 +487,16 @@ def nested(tmp_path: Path) -> tuple[Path, dict]:
     return repo, exported.plan
 
 
-def _as_exported_on_windows(document: dict) -> dict:
+def _as_exported_on_windows(document: PortablePlan | dict) -> dict:
     """The same document as an engine that recorded `wh\\dbt` exported it.
 
     The digest is recomputed over the backslash, because that is the string the
     Windows export digested.
     """
 
-    doc = json.loads(json.dumps(document))
+    doc = json.loads(
+        json.dumps(document.data() if hasattr(document, "data") else document)
+    )
     doc["project_dir"] = "wh\\dbt"
     doc["digest"] = plan_digest(PortablePlan.model_validate(doc))
     return doc

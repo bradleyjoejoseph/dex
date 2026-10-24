@@ -216,6 +216,19 @@ class Grounding(BaseModel):
     freshness: dict[str, Any] = Field(default_factory=dict)
     binding: GroundingBinding = Field(default_factory=GroundingBinding)
 
+    def __getitem__(self, key: str) -> Any:
+        if key in type(self).model_fields:
+            return getattr(self, key)
+        raise KeyError(key)
+
+    def __contains__(self, key: object) -> bool:
+        return key in type(self).model_fields
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key in type(self).model_fields:
+            return getattr(self, key)
+        return default
+
     def data(self) -> dict[str, Any]:
         # The verdict leads. A long dependency list is the ordinary case, so it
         # will be read from the top and sometimes cut from the bottom, and the
