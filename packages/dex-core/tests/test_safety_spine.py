@@ -4037,7 +4037,7 @@ def test_a_plan_document_changed_in_transit_writes_nothing(dbt_project_dir: Path
         )
         document = engine.export_plan(stored.plan_id).plan
 
-    tampered = _json.loads(_json.dumps(document))
+    tampered = _json.loads(_json.dumps(document.data()))
     tampered["edits"][0]["new_content"] = "select 999 as id\n"
 
     elsewhere = dbt_project_dir.parent.parent / "elsewhere"
