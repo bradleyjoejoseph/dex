@@ -54,6 +54,7 @@ from typing import TYPE_CHECKING
 _EXPORTS = {
     "BaselineUnreadableError": "maintain.commands",
     "BudgetExhaustedError": "results",
+    "BuildEvidenceError": "transform.evidence",
     "CacheRequiredError": "explore.commands",
     "CacheUnreadableError": "storage.base",
     "CeilingRequiredError": "guards.cost_guard",
@@ -210,6 +211,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         StoreFactory,
     )
     from .transform.build import MissingPackagesError
+    from .transform.evidence import BuildEvidenceError
     from .transform.plans import PlanError, PlanNotFoundError
     from .transform.portable import PlanDigestMismatchError, PlanDocumentError
     from .transform.scaffold import (
@@ -232,6 +234,7 @@ __all__ = [
     "DEMO_FILENAME",
     "BaselineUnreadableError",
     "BudgetExhaustedError",
+    "BuildEvidenceError",
     "CacheRequiredError",
     "CacheUnreadableError",
     "CeilingRequiredError",

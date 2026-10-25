@@ -50,12 +50,20 @@ def test_the_facade_re_exports_rather_than_re_implements():
 
     from exmergo_dex_core.envelope import EstimateQuality, Reason, reason_for
     from exmergo_dex_core.transform.classify import classify_content
-    from exmergo_dex_core.transform.evidence import BuildOutcome
+    from exmergo_dex_core.transform.evidence import (
+        BuildEvidenceError,
+        BuildOutcome,
+        recompute_outcome,
+        verify_build_evidence,
+    )
     from exmergo_dex_core.transform.grounding import MissingReference
     from exmergo_dex_core.transform.plans import PlanEdit
     from exmergo_dex_core.transform.portable import verify_plan_document
 
     assert host.verify_plan_document is verify_plan_document
+    assert host.verify_build_evidence is verify_build_evidence
+    assert host.recompute_outcome is recompute_outcome
+    assert host.BuildEvidenceError is BuildEvidenceError
     assert host.classify_content is classify_content
     assert host.BuildOutcome is BuildOutcome
     assert host.EstimateQuality is EstimateQuality
@@ -219,6 +227,88 @@ def test_each_build_vector_records_the_outcome_it_claims(vector):
     result = vector["expect"]["result"]
     assert result["outcome"] == vector["expect"]["outcome"]
     assert host.BuildOutcome(result["outcome"])
+    # Issue #581: Every shipped build-* vector recomputes to its outcome
+    recomputed = host.recompute_outcome(result)
+    assert recomputed.value == vector["expect"]["outcome"]
+    # And verify_build_evidence verifies the document cleanly
+    evidence = host.verify_build_evidence(result)
+    assert evidence.outcome.value == vector["expect"]["outcome"]
+    assert host.verify_build_evidence(
+        result, expect_outcome=vector["expect"]["outcome"]
+    )
+
+
+def test_build_evidence_refuses_contradictory_and_forged_documents():
+    """Issue #581: A vector with a forged outcome is refused, and
+    {"outcome": "validated"} is refused or recomputes to empty_selection."""
+    # {"outcome": "validated"} is refused at validation
+    assert host.recompute_outcome({"outcome": "validated"}) in {
+        host.BuildOutcome.NOT_RUN,
+        host.BuildOutcome.EMPTY_SELECTION,
+    }
+    assert (
+        host.recompute_outcome(
+            {"outcome": "validated", "invocation": {"invocation_id": "abc"}}
+        )
+        is host.BuildOutcome.EMPTY_SELECTION
+    )
+    # And is refused at validation
+    with pytest.raises((host.BuildEvidenceError, ValueError)):
+        host.BuildEvidence.model_validate({"outcome": "validated"})
+    with pytest.raises(host.BuildEvidenceError):
+        host.verify_build_evidence({"outcome": "validated"})
+
+    # Every shipped build vector with a forged outcome is refused
+    for vector in vectors_for("build-evidence"):
+        original_outcome = vector["expect"]["outcome"]
+        for forged_outcome in host.BuildOutcome:
+            if forged_outcome.value == original_outcome:
+                continue
+            forged_result = copy.deepcopy(vector["expect"]["result"])
+            forged_result["outcome"] = forged_outcome.value
+            with pytest.raises(host.BuildEvidenceError):
+                host.verify_build_evidence(forged_result)
+            with pytest.raises((host.BuildEvidenceError, ValueError)):
+                host.BuildEvidence.model_validate(forged_result)
+
+
+def test_verify_build_evidence_contract():
+    """Issue #581: verify_build_evidence accepts BuildEvidence, dict, str, and bytes."""
+    valid_vector = next(
+        v for v in vectors_for("build-evidence") if v["name"] == "build-validated"
+    )
+    result = valid_vector["expect"]["result"]
+
+    # Dict
+    ev_from_dict = host.verify_build_evidence(result)
+    assert isinstance(ev_from_dict, host.BuildEvidence)
+    assert ev_from_dict.outcome is host.BuildOutcome.VALIDATED
+
+    # BuildEvidence model
+    ev_from_model = host.verify_build_evidence(ev_from_dict)
+    assert ev_from_model is ev_from_dict
+
+    # JSON string
+    ev_from_str = host.verify_build_evidence(json.dumps(result))
+    assert isinstance(ev_from_str, host.BuildEvidence)
+
+    # JSON bytes
+    ev_from_bytes = host.verify_build_evidence(json.dumps(result).encode("utf-8"))
+    assert isinstance(ev_from_bytes, host.BuildEvidence)
+
+    # expect_outcome mismatch
+    with pytest.raises(host.BuildEvidenceError):
+        host.verify_build_evidence(result, expect_outcome="failed")
+
+    # Bad inputs
+    with pytest.raises(host.BuildEvidenceError):
+        host.verify_build_evidence("{invalid json")
+
+    with pytest.raises(host.BuildEvidenceError):
+        host.verify_build_evidence("[]")
+
+    with pytest.raises(host.BuildEvidenceError):
+        host.verify_build_evidence(12345)
 
 
 def test_the_vectors_cover_every_build_outcome_the_engine_can_report():
@@ -264,6 +354,7 @@ def test_every_new_refusal_serializes_safely_and_names_a_reason():
     refusals = [
         host.PlanDocumentError("not a readable plan document"),
         host.PlanDigestMismatchError("digest mismatch", expected="a", found="b"),
+        host.BuildEvidenceError("outcome contradicts fields"),
         host.MissingPackagesError([host.DeclaredPackage(source="hub", name="a/b")]),
         host.NotSelectOnlyError(
             "call", reason=host.RefusalReason.STORED_PROCEDURE_OR_CALL

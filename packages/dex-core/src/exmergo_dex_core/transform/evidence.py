@@ -27,10 +27,10 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from ..edits import EditOp
-from .plans import EditKind, PlanEdit
+from .plans import EditKind, PlanEdit, PlanError
 
 #: dbt node statuses that mean the node did not produce a good relation. `fail`
 #: is a test that returned rows; `error` and `runtime error` are a node that
@@ -160,6 +160,10 @@ class BuildDigests(BaseModel):
     plan_digest: str | None = None
 
 
+class BuildEvidenceError(PlanError, ValueError):
+    """A build evidence document was unreadable or contradicts its fields."""
+
+
 class BuildEvidence(BaseModel):
     """Everything a host needs to decide whether this build validated the change."""
 
@@ -189,6 +193,16 @@ class BuildEvidence(BaseModel):
         if key in type(self).model_fields:
             return getattr(self, key)
         return default
+
+    @model_validator(mode="after")
+    def _validate_outcome(self) -> BuildEvidence:
+        recomputed = recompute_outcome(self)
+        if self.outcome != recomputed:
+            raise BuildEvidenceError(
+                f"outcome '{self.outcome.value}' contradicts evidence fields "
+                f"(recomputes to '{recomputed.value}')"
+            )
+        return self
 
     def data(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -528,6 +542,123 @@ def _outcome(
     return BuildOutcome.VALIDATED
 
 
+def recompute_outcome(evidence: BuildEvidence | dict[str, Any]) -> BuildOutcome:
+    """Recompute what build outcome an evidence document actually establishes.
+
+    Uses the same precedence and rules as :func:`_outcome`, reading from the
+    carried nodes, coverage, plan drift, and artifacts freshness.
+    """
+    if isinstance(evidence, dict):
+        nodes_data = evidence.get("nodes") or []
+        nodes = [
+            BuildNode.model_validate(n) if isinstance(n, dict) else n
+            for n in nodes_data
+        ]
+        coverage_data = evidence.get("coverage")
+        coverage = (
+            BuildCoverage.model_validate(coverage_data)
+            if isinstance(coverage_data, dict)
+            else coverage_data
+        )
+        stale = evidence.get("stale_artifacts")
+        drift_data = evidence.get("plan_drift") or []
+        drift = [
+            PlanDrift.model_validate(d) if isinstance(d, dict) else d
+            for d in drift_data
+        ]
+        invocation_data = evidence.get("invocation") or {}
+        inv_id = (
+            invocation_data.get("invocation_id")
+            if isinstance(invocation_data, dict)
+            else getattr(invocation_data, "invocation_id", None)
+        )
+        elapsed = (
+            invocation_data.get("elapsed_seconds")
+            if isinstance(invocation_data, dict)
+            else getattr(invocation_data, "elapsed_seconds", None)
+        )
+        digests_data = evidence.get("digests") or {}
+        run_results_sha = (
+            digests_data.get("run_results_sha256")
+            if isinstance(digests_data, dict)
+            else getattr(digests_data, "run_results_sha256", None)
+        )
+    else:
+        nodes = evidence.nodes
+        coverage = evidence.coverage
+        stale = evidence.stale_artifacts
+        drift = evidence.plan_drift
+        inv_id = evidence.invocation.get("invocation_id")
+        elapsed = evidence.invocation.get("elapsed_seconds")
+        run_results_sha = (
+            evidence.digests.run_results_sha256
+            if evidence.digests is not None
+            else None
+        )
+
+    ran = bool(nodes) or bool(run_results_sha) or bool(inv_id) or (elapsed is not None)
+    return _outcome(ran, nodes, coverage, stale, drift)
+
+
+def verify_build_evidence(
+    document: BuildEvidence | dict[str, Any] | str | bytes,
+    *,
+    expect_outcome: BuildOutcome | str | None = None,
+) -> BuildEvidence:
+    """Verify that build evidence is internally consistent and not contradictory.
+
+    Validates that the outcome the document claims is the outcome its carried
+    nodes, coverage, drift and artifact freshness actually justify, matching
+    :func:`recompute_outcome`.
+
+    If ``expect_outcome`` is given, asserts that the verified outcome matches
+    that expected verdict.
+    """
+    if isinstance(document, (str, bytes)):
+        try:
+            parsed = json.loads(document)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise BuildEvidenceError(
+                f"not a readable build-evidence document: {exc}"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise BuildEvidenceError("build-evidence document must be a JSON object")
+        document = parsed
+
+    if isinstance(document, dict):
+        try:
+            evidence = BuildEvidence.model_validate(document)
+        except Exception as exc:
+            msg = str(exc)
+            if hasattr(exc, "errors") and exc.errors():
+                first = exc.errors()[0]
+                if "ctx" in first and "error" in first["ctx"]:
+                    msg = str(first["ctx"]["error"])
+            raise BuildEvidenceError(f"invalid build-evidence document: {msg}") from exc
+    elif isinstance(document, BuildEvidence):
+        evidence = document
+        recomputed = recompute_outcome(evidence)
+        if evidence.outcome != recomputed:
+            raise BuildEvidenceError(
+                f"outcome '{evidence.outcome.value}' contradicts evidence fields "
+                f"(recomputes to '{recomputed.value}')"
+            )
+    else:
+        raise BuildEvidenceError(
+            f"expected BuildEvidence, dict, str or bytes, got {type(document).__name__}"
+        )
+
+    if expect_outcome is not None:
+        expected = BuildOutcome(expect_outcome)
+        if evidence.outcome != expected:
+            raise BuildEvidenceError(
+                f"build outcome '{evidence.outcome.value}' is not the expected "
+                f"'{expected.value}'"
+            )
+
+    return evidence
+
+
 #: Selector syntax dex does not evaluate. Their presence is what makes
 #: `selection.complete` unanswerable rather than false.
 _SELECTOR_OPERATORS = ("+", "@", "*", ":", ",")
@@ -678,7 +809,7 @@ def build_evidence(
         coverage=coverage,
         digests=BuildDigests(
             manifest_sha256=_file_digest(manifest_path),
-            run_results_sha256=_file_digest(run_results_path),
+            run_results_sha256=_file_digest(run_results_path) if ran else None,
             source_digest=source_digest,
             plan_digest=plan_digest,
         ),
