@@ -633,6 +633,12 @@ def _build_parser() -> argparse.ArgumentParser:
                             "read"
                         ),
                     )
+                    sp.add_argument(
+                        "--duplicate",
+                        action="store_true",
+                        default=False,
+                        help="remove only ignored duplicate occurrences of key(s)",
+                    )
                 if group == "maintain" and name == "snapshot":
                     sp.add_argument(
                         "--project-only",

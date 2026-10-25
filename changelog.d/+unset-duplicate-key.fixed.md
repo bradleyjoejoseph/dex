@@ -1,0 +1,1 @@
+**`dex config unset` can remove duplicate occurrences of keys.** When a key is written more than once in `.dex/config.yml`, `dex config unset <key>` removes the earlier occurrence that YAML ignored and keeps the winning value. `dex config unset --duplicate` cleans up duplicate occurrences across the file without changing effective settings.
