@@ -497,7 +497,10 @@ def test_results_carry_typed_host_models_and_typed_accessors():
     assert isinstance(ground_result.grounding, host.Grounding)
     assert ground_result.grounding_model() is grounding_model
 
-    evidence_model = host.BuildEvidence(outcome=host.BuildOutcome.VALIDATED)
+    evidence_model = host.BuildEvidence(
+        outcome=host.BuildOutcome.VALIDATED,
+        nodes=[host.BuildNode(unique_id="model.test", name="test", status="success")],
+    )
     build_result = BuildResult(success=True, evidence=evidence_model)
     assert isinstance(build_result.evidence, host.BuildEvidence)
     assert build_result.evidence_model() is evidence_model
@@ -553,7 +556,10 @@ def test_host_models_support_backwards_compatible_subscripting():
     with pytest.raises(KeyError):
         _ = grounding["nonexistent"]
 
-    evidence = host.BuildEvidence(outcome=host.BuildOutcome.VALIDATED)
+    evidence = host.BuildEvidence(
+        outcome=host.BuildOutcome.VALIDATED,
+        nodes=[host.BuildNode(unique_id="model.test", name="test", status="success")],
+    )
     assert evidence["outcome"] == "validated"
     assert "outcome" in evidence
     assert "nonexistent" not in evidence
@@ -599,7 +605,10 @@ def test_result_data_serializes_cleanly_for_cli_envelopes():
     assert env_ground.status == "ok"
     assert env_ground.data["completeness"] == "complete"
 
-    evidence = host.BuildEvidence(outcome=host.BuildOutcome.VALIDATED)
+    evidence = host.BuildEvidence(
+        outcome=host.BuildOutcome.VALIDATED,
+        nodes=[host.BuildNode(unique_id="model.test", name="test", status="success")],
+    )
     res_build = BuildResult(success=True, evidence=evidence)
     env_build = to_envelope(res_build)
     assert env_build.status == "ok"
