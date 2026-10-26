@@ -1,0 +1,1 @@
+**`transform plan` measures row attribution for joins to existing CTEs.** Adding, removing, or changing a join to a CTE that exists in the model is now recognized and measured as a row-affecting join change with its delta rather than being skipped as bookkeeping.

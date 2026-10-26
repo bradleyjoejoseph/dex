@@ -526,15 +526,17 @@ def _join_changes(
     """
 
     # A join onto a renamed CTE is the same bookkeeping _source_changes skips.
+    renamed_prior = prior_ctes - authored_ctes
+    renamed_authored = authored_ctes - prior_ctes
     before = {
         j.key: j
         for j in sql_shape.joins(prior)
-        if not sql_shape.names_a_cte(j.relation, prior_ctes)
+        if not sql_shape.names_a_cte(j.relation, renamed_prior)
     }
     after = {
         j.key: j
         for j in sql_shape.joins(authored)
-        if not sql_shape.names_a_cte(j.relation, authored_ctes)
+        if not sql_shape.names_a_cte(j.relation, renamed_authored)
     }
     changes: list[_Change] = []
 

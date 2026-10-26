@@ -181,6 +181,90 @@ def test_an_added_source_relation_is_reported_on_the_same_footing(
     assert added[0]["delta"] is not None
 
 
+def test_a_join_to_an_existing_cte_is_reported_and_measured(
+    attributable_project, plan_edit, capsys
+):
+    """Restoring an inner join to a CTE (e.g. to deduplicate rows) is reported
+    as a join change with its measured delta, rather than dropped because the
+    relation is a CTE."""
+
+    repo, warehouse = attributable_project
+    cte_model_without_join = (
+        "{{ config(materialized='table') }}\n"
+        "with latest as (\n"
+        "    select customer_id, max(order_id) as latest_order_id\n"
+        "    from {{ source('raw', 'raw_orders') }}\n"
+        "    group by customer_id\n"
+        "),\n"
+        "base as (\n"
+        "    select * from {{ source('raw', 'raw_orders') }}\n"
+        ")\n"
+        "select base.order_id, base.customer_id, base.total_revenue\n"
+        "from base\n"
+    )
+    cte_model_with_join = cte_model_without_join.replace(
+        "from base\n",
+        "from base\ninner join latest on base.order_id = latest.latest_order_id\n",
+    )
+    (repo / "analytics" / MODEL_PATH).write_text(
+        cte_model_without_join, encoding="utf-8"
+    )
+    payload = plan_edit(cte_model_with_join)
+    model = _attribution(_plan(repo, warehouse, payload, capsys))
+    added = _by_kind(model, "join_added")
+    assert len(added) == 1, model["changes"]
+    assert "latest" in added[0]["detail"]
+    assert added[0]["attributed"] is True
+    assert added[0]["delta"] is not None
+    assert added[0]["delta"] < 0, "deduplicating join reduces rows"
+    assert model["net_delta"] == added[0]["delta"]
+
+
+def test_attribution_after_built_relation_and_project_drift(
+    attributable_project, plan_edit, capsys
+):
+    """A model built into the warehouse that has drifted from the authored SQL
+    in the project still reports row attribution when edited."""
+
+    duckdb = pytest.importorskip("duckdb")
+    repo, warehouse = attributable_project
+    conn = duckdb.connect(str(warehouse))
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS fct_orders AS "
+        "SELECT order_id, customer_id, total_revenue "
+        "FROM raw_orders WHERE total_revenue > 0"
+    )
+    conn.close()
+
+    drifted_sql = (
+        "{{ config(materialized='table') }}\n"
+        "with latest as (\n"
+        "    select customer_id, max(order_id) as latest_order_id\n"
+        "    from {{ source('raw', 'raw_orders') }}\n"
+        "    group by customer_id\n"
+        "),\n"
+        "base as (\n"
+        "    select * from {{ source('raw', 'raw_orders') }}\n"
+        ")\n"
+        "select base.order_id, base.customer_id, base.total_revenue\n"
+        "from base\n"
+    )
+    (repo / "analytics" / MODEL_PATH).write_text(drifted_sql, encoding="utf-8")
+
+    restored_sql = drifted_sql.replace(
+        "from base\n",
+        "from base\ninner join latest on base.order_id = latest.latest_order_id\n",
+    )
+    payload = plan_edit(restored_sql)
+    envelope = _plan(repo, warehouse, payload, capsys)
+    assert "row_attribution" in envelope["data"]
+    model = _attribution(envelope)
+    added = _by_kind(model, "join_added")
+    assert len(added) == 1, model["changes"]
+    assert added[0]["attributed"] is True
+    assert added[0]["delta"] is not None
+
+
 def test_a_changed_driving_relation_is_reported(
     attributable_project, plan_edit, capsys
 ):
