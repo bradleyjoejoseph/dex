@@ -1,0 +1,2 @@
+**CTEs containing set operations are recognized in plan drafting and model verification.**
+A model whose driving relation or CTE body is a `UNION` or other set operation is no longer treated as reading an unprofiled physical warehouse relation. Plan drafting does not warn that the CTE is an unprofiled relation, and verification suppresses row population with an explicit note explaining that the model has no single driving parent rather than reporting an unbuilt relation with zero findings.

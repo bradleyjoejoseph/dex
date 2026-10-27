@@ -439,7 +439,11 @@ class _Lineage:
             self.reading.grain_withheld = evidence
 
         for scope in [*self.ctes.values(), self.tree]:
-            self._collect_usage(scope)
+            if shape.SET_OPERATIONS and isinstance(scope, shape.SET_OPERATIONS):
+                for branch in shape.select_branches(scope):
+                    self._collect_usage(branch)
+            else:
+                self._collect_usage(scope)
 
         # Warehouse relations only, in the order the statement names them.
         # ``range()`` and ``read_csv_auto()`` parse as a table with an empty
@@ -543,6 +547,14 @@ class _Lineage:
         if id(select) in self._outputs:
             return self._outputs[id(select)]
         self._outputs[id(select)] = None  # a cycle reads as unreadable
+        if self.shape.SET_OPERATIONS and isinstance(select, self.shape.SET_OPERATIONS):
+            out = {
+                name.lower(): exp.column(name)
+                for name in getattr(select, "named_selects", [])
+                if name and name != "*"
+            }
+            self._outputs[id(select)] = out or None
+            return self._outputs[id(select)]
         out: dict[str, Any] = {}
         sources = self.sources(select)
         for projection in select.expressions:
@@ -582,6 +594,8 @@ class _Lineage:
         from sqlglot import expressions as exp
 
         if depth > 32:
+            return None
+        if self.shape.SET_OPERATIONS and isinstance(select, self.shape.SET_OPERATIONS):
             return None
         node = expression.this if isinstance(expression, exp.Alias) else expression
         while isinstance(node, exp.Paren):
@@ -655,6 +669,8 @@ class _Lineage:
 
         if depth > 32:
             return [], "the CTE chain is too deep to follow"
+        if self.shape.SET_OPERATIONS and isinstance(select, self.shape.SET_OPERATIONS):
+            return [], "it is a set operation, so no key was carried through it"
         outputs = self.outputs(select)
         if outputs is None:
             return [], "the SELECT list could not be read"

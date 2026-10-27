@@ -776,3 +776,73 @@ def test_a_plan_that_touches_no_model_carries_no_declarations(shop, capsys):
     )
 
     assert "declarations" not in envelope["data"]
+
+
+def test_a_cte_whose_body_is_a_union_is_not_read_as_a_physical_relation():
+    import sqlglot
+
+    from exmergo_dex_core.transform.drafting import _Lineage, _Reading
+
+    sql = (
+        "with named as (select order_id, amount from raw_orders), "
+        "residual as (select order_id, amount from archived_orders), "
+        "combined as ( "
+        "    select order_id, amount from named "
+        "    union all "
+        "    select order_id, amount from residual "
+        ") "
+        "select combined.order_id, combined.amount, c.region "
+        "from combined "
+        "cross join configured "
+        "left join customers c on combined.order_id = c.customer_id"
+    )
+    tree = sqlglot.parse_one(sql, read="duckdb")
+    reading = _Reading()
+    lineage = _Lineage(tree, {}, None, reading)
+    lineage.run()
+    assert "combined" not in reading.relations
+    assert "named" not in reading.relations
+    assert "residual" not in reading.relations
+    assert set(reading.relations) == {
+        "raw_orders",
+        "archived_orders",
+        "configured",
+        "customers",
+    }
+
+
+def test_plan_does_not_name_union_cte_as_unprofiled_relation(shop, capsys):
+    repo, warehouse = shop
+    model_sql = (
+        "with named as (\n"
+        "    select order_id, amount from {{ source('raw', 'raw_orders') }}\n"
+        "), residual as (\n"
+        "    select order_id, amount from {{ source('raw', 'raw_orders') }}\n"
+        "), combined as (\n"
+        "    select order_id, amount from named\n"
+        "    union all\n"
+        "    select order_id, amount from residual\n"
+        ")\n"
+        "select combined.order_id, combined.amount, c.region\n"
+        "from combined\n"
+        "left join {{ source('raw', 'customers') }} c\n"
+        "    on combined.order_id = c.customer_id\n"
+    )
+    envelope = _plan(
+        repo,
+        warehouse,
+        {
+            "edits": [
+                {
+                    "path": "models/marts/fct_daily.sql",
+                    "kind": "model_sql",
+                    "content": model_sql,
+                }
+            ]
+        },
+        capsys,
+    )
+
+    # Drafting should not report 'combined' as an unprofiled relation.
+    assert not any("combined" in w for w in envelope.get("warnings", []))
+    assert "fct_daily" in envelope["data"]["declarations"]

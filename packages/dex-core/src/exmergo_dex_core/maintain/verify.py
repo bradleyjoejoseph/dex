@@ -1062,8 +1062,11 @@ def _through_ctes(node, cte_scopes: dict, sql_shape, seen: set[str] | None = Non
     if name not in cte_scopes or name in seen:
         return node if name not in cte_scopes else None
     seen.add(name)
+    target_scope = cte_scopes[name]
+    if sql_shape.SET_OPERATIONS and isinstance(target_scope, sql_shape.SET_OPERATIONS):
+        return None
     return _through_ctes(
-        sql_shape.from_relation(cte_scopes[name]), cte_scopes, sql_shape, seen
+        sql_shape.from_relation(target_scope), cte_scopes, sql_shape, seen
     )
 
 
@@ -1126,6 +1129,24 @@ def _driving_parent(tree, sql_shape):
     current = tree
     visited: set[str] = set()
     while True:
+        if sql_shape.SET_OPERATIONS and isinstance(current, sql_shape.SET_OPERATIONS):
+            return (
+                None,
+                reducers,
+                found_joins,
+                multiplies,
+                "it is driven by a set operation, so it has no single parent",
+                cte_scopes,
+            )
+        if not isinstance(current, exp.Select):
+            return (
+                None,
+                reducers,
+                found_joins,
+                multiplies,
+                "its driving relation is not a table or a subquery dex can follow",
+                cte_scopes,
+            )
         reducers.extend(sql_shape.reducing_clauses(current))
         found_joins.extend(sql_shape.joins(current))
         relation = sql_shape.from_relation(current)
@@ -1787,18 +1808,9 @@ def _select_branches(tree, sql_shape) -> list:
     (no FROM at all, a VALUES list) has no join to find and returns empty.
     """
 
-    from sqlglot import expressions as exp
 
-    if isinstance(tree, exp.Select):
-        return [tree]
-    if sql_shape.SET_OPERATIONS and isinstance(tree, sql_shape.SET_OPERATIONS):
-        left = _select_branches(tree.this, sql_shape) if tree.this is not None else []
-        right_side = tree.args.get("expression")
-        right = (
-            _select_branches(right_side, sql_shape) if right_side is not None else []
-        )
-        return left + right
-    return []
+def _select_branches(tree, sql_shape):
+    return sql_shape.select_branches(tree)
 
 
 def _model_joins(tree, sql_shape) -> tuple[list[JoinCandidate], list[str]]:

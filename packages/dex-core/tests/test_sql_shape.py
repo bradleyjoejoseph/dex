@@ -186,3 +186,33 @@ def test_set_predicates_rebuilds_each_clause_it_can_read(clause):
 def test_group_by_reports_its_expressions_as_written():
     tree = _parse("select a, count(*) from t group by a")
     assert sql_shape.group_by(tree) == ["a"]
+
+
+def test_scopes_includes_set_operation_ctes():
+    sql = (
+        "with named as (select 1 as a), "
+        "residual as (select 2 as a), "
+        "combined as (select * from named union all select * from residual) "
+        "select * from combined"
+    )
+    scopes = sql_shape.scopes(_parse(sql))
+    assert set(scopes) == {"named", "residual", "combined", sql_shape.MAIN_SCOPE}
+    assert isinstance(scopes["combined"], sql_shape.SET_OPERATIONS)
+
+
+def test_select_branches_flattens_set_operations():
+    plain = _parse("select 1")
+    assert len(sql_shape.select_branches(plain)) == 1
+
+    union = _parse("select 1 union all select 2 union all select 3")
+    branches = sql_shape.select_branches(union)
+    assert len(branches) == 3
+    assert [b.sql() for b in branches] == ["SELECT 1", "SELECT 2", "SELECT 3"]
+
+    assert sql_shape.select_branches(None) == []
+
+
+def test_from_relation_handles_non_select():
+    assert sql_shape.from_relation(None) is None
+    union = _parse("select 1 union all select 2")
+    assert sql_shape.from_relation(union) is None
