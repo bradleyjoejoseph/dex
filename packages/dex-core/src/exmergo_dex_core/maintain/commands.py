@@ -37,7 +37,6 @@ from .. import command_args
 from .. import envelope as env
 from ..adapters.base import name_list
 from ..config import pii_override_paths
-from ..dbt_project import DbtProjectView
 from ..engine_version import state_version_warning
 from ..errors import (
     DexError,
@@ -1809,7 +1808,7 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
         findings,
         snap,
         cache,
-        view if isinstance(view, DbtProjectView) else None,
+        view,
         pii_overrides=pii_override_paths(engine.config.pii_overrides),
         placement=editable if isinstance(editable, PlacingProject) else None,
         definitions=definitions,

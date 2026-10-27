@@ -22,6 +22,7 @@ writes to the project and human edits stay authoritative at apply time.
 from __future__ import annotations
 
 from pathlib import PurePosixPath
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -95,7 +96,7 @@ def build(
     findings: list[DriftFinding],
     snap: Snapshot,
     cache: DexCache | None,
-    view: DbtProjectView | None,
+    view: Any | None,
     *,
     pii_overrides: PIIOverrideMatcher | None = None,
     placement: PlacingProject | None = None,
@@ -188,7 +189,7 @@ def build(
                     for finding in written
                 )
             continue
-        if view is None or model_path not in view.files:
+        if view is None or model_path is None or model_path not in view.files:
             reason = (
                 "this project format cannot receive edits"
                 if view is None
