@@ -22,12 +22,19 @@ from exmergo_dex_core.maintain.verify import (
 )
 
 
-def _write_artifacts(project_dir: Path, nodes: dict, results: list[dict]) -> None:
+def _write_artifacts(
+    project_dir: Path,
+    nodes: dict,
+    results: list[dict],
+    *,
+    metadata: dict | None = None,
+) -> None:
     target = project_dir / "target"
     target.mkdir(parents=True, exist_ok=True)
-    (target / "manifest.json").write_text(
-        json.dumps({"nodes": nodes}), encoding="utf-8"
-    )
+    manifest: dict = {"nodes": nodes}
+    if metadata is not None:
+        manifest["metadata"] = metadata
+    (target / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     (target / "run_results.json").write_text(
         json.dumps({"results": results}), encoding="utf-8"
     )
@@ -162,7 +169,7 @@ def test_a_successful_node_reports_nothing(tmp_path: Path):
 
 
 def test_a_model_with_no_matching_relation_is_reported():
-    findings = missing_relation_findings(
+    findings, notes = missing_relation_findings(
         model_relations={"stg_orders": "db.main.stg_orders"},
         live_identifiers=["db.main.customers"],
         already_reported=set(),
@@ -171,15 +178,17 @@ def test_a_model_with_no_matching_relation_is_reported():
     assert findings[0].code == "no_relation"
     assert findings[0].identifier == "stg_orders"
     assert findings[0].data["relation_name"] == "db.main.stg_orders"
+    assert notes == []
 
 
 def test_a_model_with_a_matching_relation_is_quiet():
-    findings = missing_relation_findings(
+    findings, notes = missing_relation_findings(
         model_relations={"stg_orders": "db.main.stg_orders"},
         live_identifiers=["db.main.stg_orders"],
         already_reported=set(),
     )
     assert findings == []
+    assert notes == []
 
 
 def test_a_model_already_explained_by_a_build_status_finding_is_not_repeated():
@@ -187,12 +196,64 @@ def test_a_model_already_explained_by_a_build_status_finding_is_not_repeated():
     reporting that twice under a different code would say the same thing
     about the same node in two places."""
 
-    findings = missing_relation_findings(
+    findings, notes = missing_relation_findings(
         model_relations={"stg_orders": "db.main.stg_orders"},
         live_identifiers=[],
         already_reported={"stg_orders"},
     )
     assert findings == []
+    assert notes == []
+
+
+def test_a_model_in_dev_namespace_without_target_dev_is_reported_as_unchecked():
+    """#715: without --target dev, a model whose relation is in the dev
+    namespace is reported as unchecked in notes rather than no_relation."""
+
+    findings, notes = missing_relation_findings(
+        model_relations={"stg_orders": "db.dbt_dev.stg_orders"},
+        live_identifiers=["db.shop.customers"],
+        already_reported=set(),
+        dev_scope="dbt_dev",
+        judged_namespace="shop",
+        reads_dev_target=False,
+    )
+    assert findings == []
+    assert len(notes) == 1
+    assert "the relation check was not run for stg_orders" in notes[0]
+    assert "maintain verify --target dev" in notes[0]
+
+
+def test_a_model_in_dev_namespace_with_target_dev_is_checked():
+    """#715: with --target dev, built dev relations are matched and clean."""
+
+    findings, notes = missing_relation_findings(
+        model_relations={"stg_orders": "db.dbt_dev.stg_orders"},
+        live_identifiers=["db.dbt_dev.stg_orders"],
+        already_reported=set(),
+        dev_scope="dbt_dev",
+        judged_namespace="dbt_dev",
+        reads_dev_target=True,
+    )
+    assert findings == []
+    assert notes == []
+
+
+def test_a_model_in_dev_namespace_missing_with_target_dev_is_reported():
+    """#715: with --target dev, a model missing from the dev namespace is
+    reported as no_relation."""
+
+    findings, notes = missing_relation_findings(
+        model_relations={"stg_orders": "db.dbt_dev.stg_orders"},
+        live_identifiers=["db.dbt_dev.customers"],
+        already_reported=set(),
+        dev_scope="dbt_dev",
+        judged_namespace="dbt_dev",
+        reads_dev_target=True,
+    )
+    assert len(findings) == 1
+    assert findings[0].code == "no_relation"
+    assert findings[0].identifier == "stg_orders"
+    assert notes == []
 
 
 # --- column_contract_plan / column_contract_findings: pure (#230) --------------
@@ -3250,3 +3311,211 @@ def test_verify_suppression_names_uncompiled_models_end_to_end(
     suppressed = payload["data"]["suppressed"]["row_population"]
     assert "no compiled SQL found for stg_returns" in suppressed
     assert "run `dbt compile` or `dbt build`" in suppressed
+
+
+def test_maintain_verify_refuses_prod_target(maintain_repo):
+    """#715: maintain verify --target refuses production-looking targets."""
+
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.maintain import commands as maintain_cmds
+    from exmergo_dex_core.transform.build import ProdTargetRefusedError
+
+    engine = DexEngine(repo_root=maintain_repo.root)
+    with pytest.raises(ProdTargetRefusedError, match="looks like production"):
+        maintain_cmds.verify(engine, target="prod")
+
+    with pytest.raises(ProdTargetRefusedError, match="looks like production"):
+        maintain_cmds.verify(engine, target="production")
+
+    with pytest.raises(ProdTargetRefusedError, match="not the dev target"):
+        maintain_cmds.verify(engine, target="staging")
+
+    rc, payload = maintain_repo.dex("maintain", "verify", "--target", "prod")
+    assert rc != 0
+    assert payload["status"] == "error"
+    assert any("looks like production" in err for err in payload["errors"])
+
+
+def test_maintain_verify_without_target_dev_reports_dev_models_as_unchecked(
+    maintain_repo, _assume_the_project_compiles
+):
+    """#715: without --target dev, a model that exists only in the dev namespace
+    is reported as unchecked with a note and pointer to --target dev, and never
+    as a high-severity no_relation finding. data names the judged namespace and
+    manifest target."""
+
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.stg_returns": {
+                "name": "stg_returns",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."dbt_dev"."stg_returns"',
+            }
+        },
+        results=[],
+        metadata={"target_name": "dev"},
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    data = payload["data"]
+    assert data["findings"] == []
+    assert data["manifest_target"] == "dev"
+    assert data["judged_namespace"] == "warehouse.main"
+    assert "target" not in data
+
+    suppressed = data["suppressed"]["no_relation"]
+    assert "outside the judged namespace (warehouse.main)" in suppressed
+    assert "maintain verify --target dev" in suppressed
+
+    warnings = payload["warnings"]
+    assert any(
+        "judged namespace 'warehouse.main'" in w and "maintain verify --target dev" in w
+        for w in warnings
+    )
+
+    notes = data["notes"]
+    assert any(
+        "the relation check was not run for stg_returns" in n
+        and "maintain verify --target dev" in n
+        for n in notes
+    )
+
+
+def test_maintain_verify_target_dev_reads_dev_namespace(tmp_path: Path):
+    """#715: maintain verify --target dev reads the dev namespace, judges models,
+    and returns judged_namespace and target in the result envelope."""
+
+    from exmergo_dex_core.adapters.base import ObjectMeta
+    from exmergo_dex_core.config import DexConfig, PostgresTarget
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.maintain import commands as maintain_cmds
+    from exmergo_dex_core.storage import MemoryStore
+
+    class _DevAdapter:
+        name = "postgres"
+        dialect = "postgres"
+        paradigm = Paradigm.DB_LOAD
+        cost_gate = None
+        target = PostgresTarget(schemas=["shop"], dev_schema="dbt_dev")
+
+        def __init__(self):
+            self.dev_target = None
+
+        def read_dev_target(self, scope: str | None) -> None:
+            self.dev_target = scope
+
+        def list_objects(self, *, include_views: bool = True):
+            if self.dev_target == "dbt_dev":
+                return [
+                    ObjectMeta(
+                        identifier="dexdb.dbt_dev.stg_orders",
+                        object_type="table",
+                        schema="dbt_dev",
+                        name="stg_orders",
+                        row_count=10,
+                        byte_size=1024,
+                        column_count=2,
+                    )
+                ]
+            return [
+                ObjectMeta(
+                    identifier="dexdb.shop.customers",
+                    object_type="table",
+                    schema="shop",
+                    name="customers",
+                    row_count=100,
+                    byte_size=4096,
+                    column_count=3,
+                )
+            ]
+
+        def table_metadata(self, identifier: str):
+            from exmergo_dex_core.adapters.base import ColumnMeta
+
+            return (
+                ObjectMeta(
+                    identifier=identifier,
+                    object_type="table",
+                    schema=identifier.split(".")[1],
+                    name=identifier.split(".")[-1],
+                    row_count=10,
+                    byte_size=1024,
+                    column_count=2,
+                ),
+                [
+                    ColumnMeta(
+                        name="id", data_type="integer", nullable=False, ordinal=1
+                    ),
+                    ColumnMeta(
+                        name="order_id",
+                        data_type="integer",
+                        nullable=False,
+                        ordinal=2,
+                    ),
+                ],
+            )
+
+        def exact_distinct_counts(self, identifier: str, columns: list[str]):
+            return dict.fromkeys(columns, 10)
+
+        def distinct_combination_counts(
+            self, identifier: str, combinations: list[list[str]]
+        ):
+            return {tuple(c): 10 for c in combinations}
+
+    # Set up minimal project dir with compiled dev manifest
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True)
+    (project_dir / "dbt_project.yml").write_text("name: test_proj\nversion: '1.0'\n")
+    _write_artifacts(
+        project_dir,
+        nodes={
+            "model.test_proj.stg_orders": {
+                "name": "stg_orders",
+                "resource_type": "model",
+                "relation_name": '"dexdb"."dbt_dev"."stg_orders"',
+                "columns": {
+                    "id": {"name": "id", "data_type": "integer"},
+                    "order_id": {"name": "order_id", "data_type": "integer"},
+                },
+            }
+        },
+        results=[],
+        metadata={"target_name": "dev"},
+    )
+
+    adapter = _DevAdapter()
+    config = DexConfig(
+        connector="postgres",
+        dbt_project_dir=str(project_dir),
+        postgres=PostgresTarget(schemas=["shop"], dev_schema="dbt_dev"),
+    )
+    engine = DexEngine(config=config, store=MemoryStore(), repo_root=str(tmp_path))
+    engine._adapter_instance = adapter
+
+    # Without --target dev:
+    res_no_target = maintain_cmds.verify(engine)
+    assert res_no_target.findings == []
+    assert res_no_target.target is None
+    assert res_no_target.manifest_target == "dev"
+    assert res_no_target.judged_namespace == "dexdb.shop"
+    assert "no_relation" in res_no_target.suppressed
+    data_no_target = res_no_target.data()
+    assert "target" not in data_no_target
+    assert data_no_target["manifest_target"] == "dev"
+    assert data_no_target["judged_namespace"] == "dexdb.shop"
+
+    # With --target dev:
+    res_dev = maintain_cmds.verify(engine, target="dev")
+    assert adapter.dev_target == "dbt_dev"
+    assert res_dev.findings == []
+    assert res_dev.target == "dev"
+    assert res_dev.manifest_target == "dev"
+    assert res_dev.judged_namespace == "dbt_dev"
+    assert "no_relation" not in res_dev.suppressed
+    data_dev = res_dev.data()
+    assert data_dev["target"] == "dev"
+    assert data_dev["manifest_target"] == "dev"
+    assert data_dev["judged_namespace"] == "dbt_dev"

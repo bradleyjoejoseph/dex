@@ -84,7 +84,7 @@ def route_adapter(monkeypatch):
     confirm/budget settings off the engine the way connect.py would off config."""
 
     def install(fake_client, record=None):
-        def opener(self, command=None, *, budget=None, confirmed=None):
+        def opener(self, command=None, *, budget=None, confirmed=None, **kwargs):
             return _adapter(
                 fake_client,
                 confirmed=self.confirmed if confirmed is None else confirmed,

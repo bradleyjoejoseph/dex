@@ -900,7 +900,12 @@ def _combined_scan_handshake(adapter, join_cost, facts_cost=None):
     return asker("row_population"), asker("join_contract"), asker("declared_facts")
 
 
-def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
+def verify(
+    engine: DexEngine,
+    objects: list[str] | None = None,
+    *,
+    target: str | None = None,
+) -> VerifyResult:
     """Is the project correct right now, with no baseline required (#224).
 
     Six finding classes. Build-status gaps (#225) read the compiled manifest
@@ -942,9 +947,24 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
     seam: missing relations and grain. Checks that specifically read dbt's
     ``target/`` artifacts are suppressed by name rather than preventing those
     portable checks from running.
+
+    ``target`` is dev-target only (#715): passing ``target='dev'`` reads the dev
+    namespace for the length of the command, judging models built into dev
+    without editing the source allowlist. Prod-looking targets are refused.
     """
 
     from pathlib import Path
+
+    reads_dev_target = False
+    effective_target = target
+    if target is not None:
+        from ..transform.build import assert_dev_target
+
+        assert_dev_target(target, engine.config.dbt_target)
+        reads_dev_target = True
+
+    manifest_target: str | None = None
+    judged_namespace: str | None = None
 
     project, project_reason = _read_project(engine)
     if project is None:
@@ -961,6 +981,7 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
                 "compile": reason,
             },
             warnings=[f"maintain verify could not read the project format: {reason}"],
+            target=effective_target,
         )
 
     definitions = project.definitions()
@@ -997,6 +1018,7 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
             f"{artifact_reason}"
         )
     if project_dir is not None:
+        manifest_target = verify_mod.read_manifest_target(project_dir)
         compile_finding, compile_notes = verify_mod.compile_check(project_dir)
         if compile_finding is not None:
             findings.append(compile_finding)
@@ -1017,6 +1039,8 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
                     "grain and join-contract findings suppressed: the project "
                     "does not compile, so its manifest cannot be trusted"
                 ],
+                target=effective_target,
+                manifest_target=manifest_target,
             )
             return result
 
@@ -1062,7 +1086,10 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
                 if label.split(".", 1)[0].lower() in wanted
             }
         try:
-            adapter = engine._adapter("maintain verify")
+            if reads_dev_target:
+                adapter = engine._adapter("maintain verify", reads_dev_target=True)
+            else:
+                adapter = engine._adapter("maintain verify")
         except DexError as exc:
             suppressed["no_relation"] = f"warehouse unreachable: {exc}"
             suppressed["grain"] = f"warehouse unreachable: {exc}"
@@ -1077,11 +1104,62 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
             cost = command_args.preflight_cost(adapter)
             live = adapter.list_objects()
             already = {f.identifier for f in findings if f.identifier}
-            findings.extend(
-                verify_mod.missing_relation_findings(
-                    model_relations, [o.identifier for o in live], already
+            from .. import connect
+
+            dev_scope = (
+                connect.dev_target_scope(
+                    adapter.name, getattr(engine.config, adapter.name, None)
                 )
+                if adapter is not None
+                else None
             )
+            live_namespaces = sorted(
+                {o.identifier.rsplit(".", 1)[0] for o in live if "." in o.identifier}
+            )
+            if reads_dev_target:
+                judged_namespace = dev_scope or (
+                    ", ".join(live_namespaces) if live_namespaces else "dev"
+                )
+            else:
+                judged_namespace = (
+                    ", ".join(live_namespaces)
+                    if live_namespaces
+                    else (
+                        getattr(getattr(adapter, "target", None), "schemas", None)
+                        and ", ".join(adapter.target.schemas)
+                    )
+                ) or None
+
+            relation_findings, relation_notes = verify_mod.missing_relation_findings(
+                model_relations,
+                [o.identifier for o in live],
+                already,
+                dev_scope=dev_scope,
+                judged_namespace=judged_namespace,
+                manifest_target=manifest_target,
+                reads_dev_target=reads_dev_target,
+            )
+            findings.extend(relation_findings)
+            notes.extend(relation_notes)
+            if (
+                not reads_dev_target
+                and model_relations
+                and not relation_findings
+                and relation_notes
+            ):
+                target_hint = "maintain verify --target dev"
+                ns_desc = f" ({judged_namespace})" if judged_namespace else ""
+                dev_desc = dev_scope or "dev"
+                suppressed["no_relation"] = (
+                    f"manifest relations resolve into the dev namespace ({dev_desc}), "
+                    f"which is outside the judged namespace{ns_desc}; "
+                    f"re-run with `{target_hint}` to verify dev models"
+                )
+                warnings.append(
+                    f"maintain verify judged namespace '{judged_namespace or 'prod'}'; "
+                    "all models resolve into the dev namespace, re-run with "
+                    f"`{target_hint}`"
+                )
             # A declared grain is counted with the other declared facts, in the
             # one priced statement per relation; the grain axis keeps every
             # other source, and the models no compiled manifest could carry.
@@ -1185,6 +1263,9 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
         suppressed=suppressed,
         notes=notes,
         warnings=warnings,
+        target=effective_target,
+        judged_namespace=judged_namespace,
+        manifest_target=manifest_target,
     )
     if cost is not None:
         result.cost = cost
@@ -1381,7 +1462,13 @@ def _row_population(
 
 
 def cmd_verify(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
-    return to_envelope(verify(engine, getattr(args, "objects", None)))
+    return to_envelope(
+        verify(
+            engine,
+            getattr(args, "objects", None),
+            target=getattr(args, "target", None),
+        )
+    )
 
 
 def semantic_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:

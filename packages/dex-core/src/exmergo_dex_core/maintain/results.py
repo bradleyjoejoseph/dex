@@ -165,13 +165,23 @@ class VerifyResult(Result):
 
     findings: list[DriftFinding] = Field(default_factory=list)
     suppressed: dict[str, str] = Field(default_factory=dict)
+    target: str | None = None
+    judged_namespace: str | None = None
+    manifest_target: str | None = None
 
     def data(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "findings": [f.model_dump(mode="json") for f in self.findings],
             "finding_count": len(self.findings),
             "suppressed": self.suppressed,
         }
+        if self.target is not None:
+            payload["target"] = self.target
+        if self.judged_namespace is not None:
+            payload["judged_namespace"] = self.judged_namespace
+        if self.manifest_target is not None:
+            payload["manifest_target"] = self.manifest_target
+        return payload
 
 
 class ReconcileResult(Result):

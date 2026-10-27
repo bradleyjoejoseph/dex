@@ -44,7 +44,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..cache import match_identifier
+from ..cache import match_identifier, relation_verdict
 from ..dbt_project import manifest_node_label, strip_relation_quoting
 from ..errors import WarehouseQueryError
 from ..explore.profile import NEAR_UNIQUE_RATIO
@@ -125,6 +125,24 @@ def _run_results(project_dir: Path) -> list[dict] | None:
     if not path.is_file():
         return None
     return json.loads(path.read_text(encoding="utf-8")).get("results", [])
+
+
+def read_manifest_target(project_dir: Path) -> str | None:
+    """The target dbt compiled the manifest against, from target/manifest.json."""
+
+    path = project_dir / "target" / "manifest.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        metadata = data.get("metadata")
+        if isinstance(metadata, dict):
+            target_name = metadata.get("target_name")
+            if isinstance(target_name, str) and target_name:
+                return target_name
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+    return None
 
 
 def build_status_findings(project_dir: Path) -> tuple[list[DriftFinding], list[str]]:
@@ -238,7 +256,12 @@ def missing_relation_findings(
     model_relations: dict[str, str],
     live_identifiers: list[str],
     already_reported: set[str],
-) -> list[DriftFinding]:
+    *,
+    dev_scope: str | None = None,
+    judged_namespace: str | None = None,
+    manifest_target: str | None = None,
+    reads_dev_target: bool = False,
+) -> tuple[list[DriftFinding], list[str]]:
     """Manifest models with no corresponding relation in the warehouse.
 
     ``already_reported`` names models a build-status finding already
@@ -247,14 +270,59 @@ def missing_relation_findings(
     same thing about the same node in two places). ``model_relations`` holds
     models only: a source's own "declared but absent" case belongs to the
     schema axis, which already reports dangling sources against a baseline.
+
+    When ``reads_dev_target`` is False, models whose relations resolve into
+    the dev namespace (or outside the judged namespace when the manifest was
+    compiled against dev) are reported as unchecked in notes with a pointer
+    to ``maintain verify --target dev``, rather than as high-severity
+    ``no_relation`` findings (#715).
     """
 
     findings: list[DriftFinding] = []
+    unchecked: list[str] = []
+    judged_schemas = (
+        {s.strip().lower() for s in judged_namespace.split(",")}
+        if judged_namespace
+        else set()
+    )
+
     for name, relation in sorted(model_relations.items()):
         if name in already_reported:
             continue
         if match_identifier(relation, live_identifiers):
             continue
+
+        if not reads_dev_target:
+            clean_rel = strip_relation_quoting(relation).lower()
+            rel_parts = clean_rel.split(".")
+            rel_ns = clean_rel.rsplit(".", 1)[0] if len(rel_parts) > 1 else ""
+            rel_schema = rel_parts[-2] if len(rel_parts) > 1 else ""
+            is_dev = False
+
+            if dev_scope and (
+                dev_scope.lower() in clean_rel
+                or rel_schema == dev_scope.lower().split(".")[-1]
+                or rel_ns == dev_scope.lower()
+            ):
+                is_dev = True
+            elif manifest_target == "dev":
+                in_judged = (
+                    rel_ns in judged_schemas
+                    or rel_schema in judged_schemas
+                    or any(clean_rel.startswith(js + ".") for js in judged_schemas)
+                )
+                if not in_judged:
+                    is_dev = True
+            elif (
+                live_identifiers
+                and relation_verdict(relation, live_identifiers) == "foreign"
+            ):
+                is_dev = True
+
+            if is_dev:
+                unchecked.append(name)
+                continue
+
         findings.append(
             DriftFinding(
                 axis="build",
@@ -268,7 +336,17 @@ def missing_relation_findings(
                 data={"relation_name": relation},
             )
         )
-    return findings
+
+    notes: list[str] = []
+    if unchecked:
+        target_hint = "maintain verify --target dev"
+        models_str = ", ".join(sorted(unchecked))
+        notes.append(
+            f"the relation check was not run for {models_str}: relation resolves into "
+            "the dev namespace, which is outside the read scope; re-run with "
+            f"`{target_hint}` to verify dev models"
+        )
+    return findings, notes
 
 
 # --- column contract: a built relation against its declared schema.yml ---------

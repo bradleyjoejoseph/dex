@@ -1387,10 +1387,15 @@ class DexEngine:
 
         return maintain.reconcile(self, drift_class)
 
-    def verify(self, objects: list[str] | None = None) -> VerifyResult:
+    def verify(
+        self,
+        objects: list[str] | None = None,
+        *,
+        target: str | None = None,
+    ) -> VerifyResult:
         from .maintain import commands as maintain
 
-        return maintain.verify(self, objects)
+        return maintain.verify(self, objects, target=target)
 
     # --- transform --------------------------------------------------------
     #
