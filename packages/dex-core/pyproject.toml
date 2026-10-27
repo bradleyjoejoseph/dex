@@ -387,3 +387,13 @@ markers = [
   "trino_iceberg: narrow Trino integration tests against the Glue and S3 Iceberg catalog (protected credentials required)",
   "packaging: builds a wheel and runs against it in an isolated environment; slow, needs uv",
 ]
+
+[tool.mypy]
+python_version = "3.11"
+plugins = ["pydantic.mypy"]
+files = [
+  "src/exmergo_dex_core/maintain",
+  "src/exmergo_dex_core/storage",
+]
+ignore_missing_imports = true
+follow_imports = "silent"

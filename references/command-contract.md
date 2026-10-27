@@ -353,9 +353,10 @@ dex maintain snapshot [--project-only]
                                   -> capture/refresh the known-good baseline in .dex/snapshot.json;
                                      --project-only re-fingerprints only project layers and carries the
                                      existing warehouse baseline and its timestamps forward without opening
-                                     a warehouse connection; each model's declaration (descriptions and
-                                     config.meta.dex, per model and per column) is fingerprinted as one
-                                     hash per field, counted in transform_layer.declared_model_count
+                                     a warehouse connection, reporting data.baseline.carried_forward: true;
+                                     each model's declaration (descriptions and config.meta.dex, per model
+                                     and per column) is fingerprinted as one hash per field, counted in
+                                     transform_layer.declared_model_count
 dex maintain check                -> sweep every drift axis vs the snapshot; ranked report (read-only;
                                      two-phase on billed connectors: free axes now, one estimate for scans)
 dex maintain schema [<objects>]   -> structural drift: columns/tables added, dropped, retyped, renamed;

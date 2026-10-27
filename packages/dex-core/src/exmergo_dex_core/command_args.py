@@ -15,7 +15,7 @@ import argparse
 import math
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from .adapters.base import Adapter
 from .config import CONFIG_FILE
@@ -602,7 +602,10 @@ def sample_handshake(
     )
 
 
-def stamp_spend(result: Result, adapter: Adapter) -> Result:
+_ResultT = TypeVar("_ResultT", bound=Result)
+
+
+def stamp_spend(result: _ResultT, adapter: Adapter) -> _ResultT:
     """Stamp the preflight cost and the actual spend onto a result.
 
     ``cost`` stays a preflight estimate by contract; actual billed bytes or

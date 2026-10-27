@@ -684,15 +684,16 @@ def _declared_grain_findings(
             single_counts[names[0]] = distinct
 
     combo_counts: dict[tuple[str, ...], int] = {}
-    for _, names in resolved:
-        if names is None or len(names) == 1:
-            continue
-        result = adapter.distinct_combination_counts(identifier, [names])
-        distinct = result.get(tuple(names))
+    combos = [
+        (c, names) for c, names in resolved if names is not None and len(names) > 1
+    ]
+    for _, combo_names in combos:
+        result = adapter.distinct_combination_counts(identifier, [combo_names])
+        distinct = result.get(tuple(combo_names))
         if distinct is None:
             scan_failed = True
             continue
-        combo_counts[tuple(names)] = distinct
+        combo_counts[tuple(combo_names)] = distinct
 
     # A scan that ran may have upgraded the catalog count to the exact
     # total; only fall back to the pre-scan count when it did not.
@@ -722,10 +723,8 @@ def _declared_grain_findings(
             )
         )
 
-    for c, names in resolved:
-        if names is None or len(names) == 1:
-            continue
-        distinct = combo_counts.get(tuple(names))
+    for c, combo_names in combos:
+        distinct = combo_counts.get(tuple(combo_names))
         if distinct is None:
             continue
         if distinct >= row_count:

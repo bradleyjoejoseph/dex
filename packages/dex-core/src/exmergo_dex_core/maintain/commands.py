@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from pydantic import ValidationError
 
@@ -37,6 +37,7 @@ from .. import command_args
 from .. import envelope as env
 from ..adapters.base import name_list
 from ..config import pii_override_paths
+from ..dbt_project import DbtProjectView
 from ..engine_version import state_version_warning
 from ..errors import (
     DexError,
@@ -48,7 +49,7 @@ from ..errors import (
 from ..guards import dialect as dialect_guard
 from ..guards.dialect import DialectDependencyError
 from ..results import ConfirmationRequest, to_envelope
-from ..storage import Document, FilesystemStore, MaintainStore, readable_cache
+from ..storage import Document, FilesystemStore, MaintainStore, Store, readable_cache
 from . import declared_facts as facts_mod
 from . import drift as drift_mod
 from . import snapshot as snapshot_mod
@@ -66,6 +67,11 @@ if TYPE_CHECKING:
     from ..dbt_project import ProjectDefinitions
     from ..engine import DexEngine
     from .snapshot import SemanticLayer, TransformLayer
+
+
+def _maintain_store(engine: DexEngine) -> MaintainStore:
+    return cast(MaintainStore, engine.store)
+
 
 _SNAPSHOT_HINT = (
     "re-run `maintain snapshot` after each known-good build so drift is measured "
@@ -508,7 +514,7 @@ def snapshot(engine: DexEngine, *, project_only: bool = False) -> SnapshotResult
     metadata-only baseline silently disarms two of the four axes.
     """
 
-    store = engine.store
+    store = _maintain_store(engine)
     config = engine.config
     warnings: list[str] = []
 
@@ -530,7 +536,11 @@ def snapshot(engine: DexEngine, *, project_only: bool = False) -> SnapshotResult
         cache = readable_cache(store)
         requested = engine.connector or config.connector
         usable = cache is not None and bool(cache.datasets)
-        if usable and cache.provenance.connector not in (None, requested):
+        if (
+            usable
+            and cache is not None
+            and cache.provenance.connector not in (None, requested)
+        ):
             warnings.append(
                 "the exploration cache was mapped on "
                 f"'{cache.provenance.connector}' but "
@@ -539,7 +549,7 @@ def snapshot(engine: DexEngine, *, project_only: bool = False) -> SnapshotResult
             )
             usable = False
 
-        if usable:
+        if usable and cache is not None:
             warehouse = snapshot_mod.warehouse_from_cache(cache)
             connector = cache.provenance.connector or requested
             warehouse_from = "cache"
@@ -573,7 +583,6 @@ def snapshot(engine: DexEngine, *, project_only: bool = False) -> SnapshotResult
         warehouse=warehouse,
         warehouse_from=warehouse_from,
         cache_updated_at=cache_updated_at,
-        warehouse_carried_forward=project_only,
         transform_layer=transform_layer,
         semantic_layer=semantic_layer,
     )
@@ -598,6 +607,7 @@ def snapshot(engine: DexEngine, *, project_only: bool = False) -> SnapshotResult
         column_detail_count=len(warehouse.datasets)
         - len(warehouse.without_column_detail()),
         cache_updated_at=cache_updated_at,
+        warehouse_carried_forward=project_only,
         transform_layer=(
             LayerFingerprint(
                 file_count=len(transform_layer.files),
@@ -663,7 +673,7 @@ def schema_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRe
     ``_detect_free_axis``.
     """
 
-    store = engine.store
+    store = _maintain_store(engine)
     snap = _require_baseline(store)
 
     warnings: list[str] = []
@@ -739,7 +749,7 @@ def grain_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRes
     exactly the statements it would run. Free connectors run immediately.
     """
 
-    store = engine.store
+    store = _maintain_store(engine)
     snap = _require_baseline(store)
     scope_names = list(objects or [])
 
@@ -1394,7 +1404,7 @@ def semantic_drift(engine: DexEngine, objects: list[str] | None = None) -> Drift
     scan rather than throwing away work that cost nothing but is real.
     """
 
-    store = engine.store
+    store = _maintain_store(engine)
     snap = _require_baseline(store)
     current_transform, current_semantic, no_project = _read_layers(engine)
     if no_project is not None:
@@ -1496,7 +1506,7 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
     subset, not just the reported findings.
     """
 
-    store = engine.store
+    store = _maintain_store(engine)
     snap = _require_baseline(store)
     config = engine.config
     scope_names = list(objects or [])
@@ -1694,7 +1704,7 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
     from ..transform import plans as plans_mod
     from . import reconcile as reconcile_mod
 
-    store = engine.store
+    store = _maintain_store(engine)
     snap = _require_baseline(store)
     report = _stored_drift(store)
     if report is None:
@@ -1799,7 +1809,7 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
         findings,
         snap,
         cache,
-        view,
+        view if isinstance(view, DbtProjectView) else None,
         pii_overrides=pii_override_paths(engine.config.pii_overrides),
         placement=editable if isinstance(editable, PlacingProject) else None,
         definitions=definitions,
@@ -1828,7 +1838,7 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
             edits,
             project_dir=view.root,
             repo_root=repo_root,
-            store=store,
+            store=cast(Store, store),
             # The format that placed these edits also validates them. Passing it
             # is what keeps the two halves of the check on the same project: the
             # surface each path must land in, and the file each edit is pinned
@@ -1939,7 +1949,7 @@ def _detect_free_axis(
     one that checked and found nothing, and the two mean opposite things.
     """
 
-    store = engine.store
+    store = _maintain_store(engine)
     snap = _require_baseline(store)
 
     adapter = engine._adapter(f"maintain {axis}")
@@ -2216,6 +2226,8 @@ def _declaration_drift(
     baseline = snap.transform_layer
     status: dict[str, object] = {"checked": checked}
     if checked:
+        if baseline is None or current_transform is None:
+            return [], status, []
         status["baseline_declared_models"] = len(baseline.declarations or {})
         status["declared_models"] = len(current_transform.declarations or {})
         findings = _semantic_scope(

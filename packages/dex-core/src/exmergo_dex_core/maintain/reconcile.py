@@ -133,7 +133,11 @@ def build(
     definition_churn = False
     orphan_identifiers: list[str] = []
     for finding in findings:
-        if finding.axis == "schema" and finding.code in _PATCHABLE:
+        if (
+            finding.axis == "schema"
+            and finding.code in _PATCHABLE
+            and finding.identifier is not None
+        ):
             schema_patches.setdefault(finding.identifier, []).append(finding)
         elif finding.code.startswith("definition_") or finding.code.startswith(
             "model_"
@@ -143,7 +147,7 @@ def build(
             # warehouse-side fix to propose.
             definition_churn = True
         else:
-            if finding.code == "orphan_relation":
+            if finding.code == "orphan_relation" and finding.identifier is not None:
                 orphan_identifiers.append(finding.identifier)
             proposals.append(_advisory(finding))
 
@@ -299,6 +303,9 @@ def _run_operation_args(identifiers: list[str]) -> str:
 
 def _advisory(finding: DriftFinding) -> Proposal:
     if finding.code == "orphan_relation":
+        operation_args = _run_operation_args(
+            [finding.identifier] if finding.identifier else []
+        )
         return Proposal(
             axis=finding.axis,
             kind="advisory",
@@ -311,8 +318,7 @@ def _advisory(finding: DriftFinding) -> Proposal:
                 "governed macro (dex never executes this itself): scaffold "
                 "it with `transform macro drop_orphan_relations` if the "
                 "project does not have it yet, then run dbt run-operation "
-                "drop_orphan_relations --args "
-                f"'{_run_operation_args([finding.identifier])}'"
+                f"drop_orphan_relations --args '{operation_args}'"
             ),
         )
     actions = {

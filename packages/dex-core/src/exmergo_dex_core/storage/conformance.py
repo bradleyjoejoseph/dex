@@ -569,6 +569,32 @@ class MaintainStoreContract(ExploreStoreContract):
             "Check that make_store(key) actually keys storage"
         )
 
+    def test_an_interrupted_save_leaves_the_previous_snapshot_readable(
+        self, store, monkeypatch
+    ):
+        initial = a_snapshot()
+        store.save_snapshot(initial)
+        assert store.load_snapshot() is not None
+
+        if hasattr(store, "_write_document"):
+            from pathlib import Path
+
+            def failing_replace(self_path, target):
+                raise OSError("simulated interruption during atomic replace")
+
+            monkeypatch.setattr(Path, "replace", failing_replace)
+            with pytest.raises(OSError, match="simulated interruption"):
+                store.save_snapshot(
+                    initial.model_copy(update={"warehouse_from": "interrupted"})
+                )
+
+        loaded = store.load_snapshot()
+        assert loaded is not None, (
+            "an interrupted save must leave the previous snapshot readable"
+        )
+        assert loaded.created_at == initial.created_at
+        assert loaded.warehouse_from == initial.warehouse_from
+
 
 class StoreContract(MaintainStoreContract):
     """The full contract: everything above, plus the transform plan store."""

@@ -126,7 +126,8 @@ def plan(
         meta = node.get("test_metadata")
         if not isinstance(meta, dict) or meta.get("name") != "unique":
             continue
-        kwargs = meta.get("kwargs") if isinstance(meta.get("kwargs"), dict) else {}
+        raw_kwargs = meta.get("kwargs")
+        kwargs: dict[str, Any] = raw_kwargs if isinstance(raw_kwargs, dict) else {}
         column = kwargs.get("column_name")
         attached = node.get("attached_node")
         if isinstance(column, str) and isinstance(attached, str):

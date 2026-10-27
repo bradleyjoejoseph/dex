@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import difflib
 from collections.abc import Iterable
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from pydantic import BaseModel, Field
 
@@ -620,7 +620,7 @@ def declaration_drift(
         for column, was, now in targets:
             if was is None and now is None:
                 continue
-            if was is None:
+            if was is None and now is not None:
                 finding(
                     "declaration_added",
                     model,
@@ -631,7 +631,7 @@ def declaration_drift(
                     {"fields": sorted(now), "path": after.path},
                 )
                 continue
-            if now is None:
+            if now is None and was is not None:
                 finding(
                     "declaration_removed",
                     model,
@@ -640,6 +640,8 @@ def declaration_drift(
                     f"{subject(model, column)} no longer declares {_field_list(was)}",
                     {"fields": sorted(was), "model_present": True, "path": before.path},
                 )
+                continue
+            if was is None or now is None:
                 continue
             for field in sorted(was.keys() | now.keys()):
                 if was.get(field) == now.get(field):
@@ -1118,8 +1120,8 @@ def grain_plan(
                 continue
             if dataset.identifier not in current:
                 continue
-            meta, columns = adapter.table_metadata(dataset.identifier)
-            null_checks.append((dataset, columns, meta.row_count))
+            meta, col_metas = adapter.table_metadata(dataset.identifier)
+            null_checks.append((dataset, col_metas, meta.row_count))
 
     cardinality_checks = _join_cardinality_checks(
         semantic, sorted(current), scope, describe, notes
@@ -1448,10 +1450,10 @@ def batched_probes(
         for check in plan.join_cardinality_checks or []:
             add_combinations(check.identifier, [check.columns])
     if callable(getattr(adapter, "column_aggregates", None)):
-        for dataset, columns, row_count in plan.null_checks or []:
-            if row_count == 0 or not columns:
+        for dataset, col_metas, row_count in plan.null_checks or []:
+            if row_count == 0 or not col_metas:
                 continue  # reported as no_rows without a scan
-            null_columns[dataset.identifier] = list(columns)
+            null_columns[dataset.identifier] = list(col_metas)
             statements[dataset.identifier] = statements.get(dataset.identifier, 0) + 1
     for identifier, columns in _live_cardinality_columns(
         adapter, cardinality_checks or []
@@ -1486,10 +1488,12 @@ def run_batched_probes(
     is absent, so its probes run separately and degrade on their own terms."""
 
     results: dict[str, TableProbe] = {}
-    for identifier, needs in batched.items():
-        probe = adapter.table_probe(identifier, **needs._asdict())
-        if probe is not None:
-            results[identifier] = probe
+    table_probe = getattr(adapter, "table_probe", None)
+    if callable(table_probe):
+        for identifier, needs in batched.items():
+            probe = table_probe(identifier, **needs._asdict())
+            if probe is not None:
+                results[identifier] = probe
     return results
 
 
@@ -1517,10 +1521,12 @@ def grain_estimate(
     if batched is None:
         batched = batched_probes(adapter, plan)
     per_table: dict[str, float] = {}
+    table_probe_sql = getattr(adapter, "table_probe_sql", None)
     for identifier, needs in batched.items():
-        per_table[identifier] = query_estimate(
-            adapter.table_probe_sql(identifier, **needs._asdict())
-        )
+        if callable(table_probe_sql):
+            per_table[identifier] = query_estimate(
+                table_probe_sql(identifier, **needs._asdict())
+            )
     for dataset, keys, _row_count in plan.key_checks:
         if dataset.identifier in batched:
             continue
@@ -1788,7 +1794,7 @@ def grain_drift(
             grain_clause = (
                 ""
                 if grain_holds is None
-                else f"; the grain ({', '.join(dataset.grain)}) "
+                else f"; the grain ({', '.join(dataset.grain or [])}) "
                 + ("is still unique" if grain_holds else "is no longer unique either")
             )
             findings.append(
@@ -2026,9 +2032,10 @@ def grain_drift(
             # retains it for the rest of the command.
             row_count = adapter.table_metadata(dataset.identifier)[0].row_count
 
+        if row_count is None or row_count == 0:
             if row_count == 0:
                 findings.append(no_rows(dataset))
-                continue
+            continue
 
         joins = [
             {
@@ -2137,9 +2144,13 @@ def semantic_free_drift(
     )
     hashes_comparable = provenance is None
 
-    base_defs = {("semantic_model", d.name): d for d in baseline.semantic_models}
+    base_defs: dict[tuple[str, str], Any] = {
+        ("semantic_model", d.name): d for d in baseline.semantic_models
+    }
     base_defs.update({("metric", m.name): m for m in baseline.metrics})
-    cur_defs = {("semantic_model", d.name): d for d in current.semantic_models}
+    cur_defs: dict[tuple[str, str], Any] = {
+        ("semantic_model", d.name): d for d in current.semantic_models
+    }
     cur_defs.update({("metric", m.name): m for m in current.metrics})
     if vendor_changed:
         # Another vendor's names are another vocabulary: every definition on
