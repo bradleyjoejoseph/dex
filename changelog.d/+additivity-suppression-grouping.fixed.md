@@ -1,0 +1,1 @@
+**`maintain verify` now groups identical declared-fact suppression reasons across models.** When multiple models share a reason for an unmeasured axis (such as additivity), the suppression message reports the reason once with the model count and list, avoiding repetitive output. A grammar error in the missing ordering-entity message ("there is no an entity") is also fixed.

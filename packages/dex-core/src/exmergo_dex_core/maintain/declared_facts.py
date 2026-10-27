@@ -554,11 +554,12 @@ def _cumulative_candidate(model: DeclaredModel, resolve, live):
             if is_id_shaped(spelled) and spelled.lower() != single_key
         ]
     if not temporals or not entities:
-        missing = " and ".join(
-            what
-            for what, found in (("an entity", entities), ("a time column", temporals))
-            if not found
-        )
+        if not entities and not temporals:
+            missing = "entity or time column"
+        elif not entities:
+            missing = "entity"
+        else:
+            missing = "time column"
         return None, (
             f"there is no {missing} to order it by; declare a `time` role and a "
             "`foreign_key` role, or a composite grain naming both"
@@ -789,10 +790,45 @@ def findings(
             reasons = prepared.dropped.get(finding_class) or [
                 "no declared column could be measured"
             ]
-            result.suppressed[finding_class] = (
-                "no declaration could be checked: " + "; ".join(reasons)
-            )
+            result.suppressed[finding_class] = _format_suppressed_reasons(reasons)
     return result
+
+
+def _format_suppressed_reasons(reasons: list[str]) -> str:
+    """Group identical dropped reasons across models for a readable summary."""
+    groups: dict[str, list[str]] = {}
+    for item in reasons:
+        if ": " in item:
+            model, reason = item.split(": ", 1)
+            models = groups.setdefault(reason, [])
+            if model not in models:
+                models.append(model)
+        else:
+            groups.setdefault(item, [])
+
+    if len(groups) == 1:
+        reason, models = next(iter(groups.items()))
+        if len(models) > 1:
+            names = ", ".join(models)
+            return (
+                f"no declaration could be checked ({len(models)} models: {names}): "
+                f"{reason}"
+            )
+        if len(models) == 1:
+            return f"no declaration could be checked: {models[0]}: {reason}"
+        return f"no declaration could be checked: {reason}"
+
+    formatted_groups = []
+    for reason, models in groups.items():
+        if len(models) > 1:
+            names = ", ".join(models)
+            formatted_groups.append(f"({len(models)} models: {names}): {reason}")
+        elif len(models) == 1:
+            formatted_groups.append(f"{models[0]}: {reason}")
+        else:
+            formatted_groups.append(reason)
+
+    return "no declaration could be checked: " + "; ".join(formatted_groups)
 
 
 def _refusal(exc: Exception) -> str:

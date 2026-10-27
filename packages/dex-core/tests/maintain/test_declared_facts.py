@@ -890,3 +890,152 @@ def test_an_additivity_finding_names_columns_as_declared(tmp_path: Path):
     assert finding.column == "running_total"
     assert finding.data["entity"] == "customer_id"
     assert finding.data["ordered_by"] == "placed_at"
+
+
+def test_format_suppressed_reasons_groups_identical_reasons():
+    from exmergo_dex_core.maintain.declared_facts import _format_suppressed_reasons
+
+    # Single group with multiple models
+    assert _format_suppressed_reasons(
+        [
+            "fct_a: there is no entity to order it by",
+            "fct_b: there is no entity to order it by",
+            "fct_c: there is no entity to order it by",
+        ]
+    ) == (
+        "no declaration could be checked (3 models: fct_a, fct_b, fct_c): "
+        "there is no entity to order it by"
+    )
+
+    # Single group with one model
+    assert (
+        _format_suppressed_reasons(["fct_a: there is no entity to order it by"])
+        == "no declaration could be checked: fct_a: there is no entity to order it by"
+    )
+
+    # Single group with no model prefix
+    assert (
+        _format_suppressed_reasons(["no declared column could be measured"])
+        == "no declaration could be checked: no declared column could be measured"
+    )
+
+    # Multiple groups
+    assert _format_suppressed_reasons(
+        [
+            "fct_a: there is no entity to order it by",
+            "fct_b: there is no entity to order it by",
+            "fct_c: the built relation has no rows",
+        ]
+    ) == (
+        "no declaration could be checked: "
+        "(2 models: fct_a, fct_b): there is no entity to order it by; "
+        "fct_c: the built relation has no rows"
+    )
+
+
+def test_cumulative_candidate_missing_columns_grammar():
+    from exmergo_dex_core.maintain.declared_facts import (
+        DeclaredModel,
+        _cumulative_candidate,
+    )
+
+    # 1. Model with temporal column but no entity column
+    model_time_only = DeclaredModel(
+        unique_id="model.p.m1",
+        model="m1",
+        relation="db.s.m1",
+        additive=("amount",),
+        roles=(("placed_at", "time"),),
+    )
+
+    def resolve_time(col):
+        if col == "placed_at":
+            return ("placed_at", "date")
+        if col == "amount":
+            return ("amount", "double")
+        return None
+
+    candidate, reason = _cumulative_candidate(model_time_only, resolve_time, None)
+    assert candidate is None
+    assert reason.startswith("there is no entity to order it by")
+    assert "there is no an entity" not in reason
+
+    # 2. Model with entity column but no temporal column
+    model_entity_only = DeclaredModel(
+        unique_id="model.p.m2",
+        model="m2",
+        relation="db.s.m2",
+        additive=("amount",),
+        roles=(("cust_id", "foreign_key"),),
+    )
+
+    def resolve_entity(col):
+        if col == "cust_id":
+            return ("cust_id", "integer")
+        if col == "amount":
+            return ("amount", "double")
+        return None
+
+    candidate, reason = _cumulative_candidate(model_entity_only, resolve_entity, None)
+    assert candidate is None
+    assert reason.startswith("there is no time column to order it by")
+    assert "there is no a time" not in reason
+
+    # 3. Model with neither entity nor temporal column
+    model_neither = DeclaredModel(
+        unique_id="model.p.m3",
+        model="m3",
+        relation="db.s.m3",
+        additive=("amount",),
+    )
+
+    def resolve_neither(col):
+        if col == "amount":
+            return ("amount", "double")
+        return None
+
+    candidate, reason = _cumulative_candidate(model_neither, resolve_neither, None)
+    assert candidate is None
+    assert reason.startswith("there is no entity or time column to order it by")
+
+
+def test_identical_additivity_suppression_reasons_are_grouped_across_models(
+    tmp_path: Path,
+):
+    """#884: models that share a suppression reason are grouped and report
+    'there is no entity to order it by' without grammatical errors."""
+
+    result = _run(
+        tmp_path,
+        {
+            "model.p.t1": _model(
+                "t1", columns=_additive("amount", placed_at={"role": "time"})
+            ),
+            "model.p.t2": _model(
+                "t2", columns=_additive("amount", placed_at={"role": "time"})
+            ),
+            "model.p.t3": _model(
+                "t3", columns=_additive("amount", placed_at={"role": "time"})
+            ),
+        },
+        (
+            "CREATE TABLE t1 AS SELECT DATE '2024-01-01' + i::INTEGER AS placed_at, "
+            "i * 1.0 AS amount FROM range(50) t(i)"
+        ),
+        (
+            "CREATE TABLE t2 AS SELECT DATE '2024-01-01' + i::INTEGER AS placed_at, "
+            "i * 1.0 AS amount FROM range(50) t(i)"
+        ),
+        (
+            "CREATE TABLE t3 AS SELECT DATE '2024-01-01' + i::INTEGER AS placed_at, "
+            "i * 1.0 AS amount FROM range(50) t(i)"
+        ),
+    )
+    assert result.findings == []
+    suppressed = result.suppressed["additivity"]
+    assert suppressed == (
+        "no declaration could be checked (3 models: t1, t2, t3): "
+        "there is no entity to order it by; declare a `time` role and a "
+        "`foreign_key` role, or a composite grain naming both"
+    )
+    assert "there is no an entity" not in suppressed
