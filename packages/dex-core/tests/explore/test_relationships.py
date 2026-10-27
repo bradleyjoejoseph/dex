@@ -1297,19 +1297,20 @@ def _rel(
     ("rel", "expect_finding"),
     [
         (_rel(orphan_fraction=1.0), True),
-        (_rel(orphan_fraction=0.9), True),  # exactly at the threshold
-        # The existing heavy-orphan demotion case: a real signal, but not
-        # catastrophic enough for this finding -- a different tier.
-        (_rel(orphan_fraction=0.6), False),
+        (_rel(orphan_fraction=0.9), True),
+        (_rel(orphan_fraction=0.6), True),  # above the 0.5 threshold (issue #719)
+        (_rel(orphan_fraction=0.5), True),  # exactly at the 0.5 threshold
+        (_rel(orphan_fraction=0.4), False),  # below 0.5: demoted, not finding
         (_rel(orphan_fraction=0.0), False),
         (_rel(orphan_fraction=None), False),  # verified but nothing measured
         (_rel(verified=False, orphan_fraction=1.0), False),  # nothing measured
         # Issue #163: a declared join is probed now, so it reaches this
         # decision at all. It qualifies on the same measured threshold as an
-        # inferred one -- see the wording split below for why it is not the
+        # inferred one: see the wording split below for why it is not the
         # same finding.
         (_rel(kind=RelationshipKind.DECLARED, orphan_fraction=1.0), True),
-        (_rel(kind=RelationshipKind.DECLARED, orphan_fraction=0.6), False),
+        (_rel(kind=RelationshipKind.DECLARED, orphan_fraction=0.6), True),
+        (_rel(kind=RelationshipKind.DECLARED, orphan_fraction=0.4), False),
         (
             _rel(kind=RelationshipKind.DECLARED, verified=False, orphan_fraction=1.0),
             False,
@@ -2384,3 +2385,147 @@ def test_an_edge_inference_also_found_is_not_reported_as_rescued():
     notes = _semantic_join_notes(semantic, 0, inferred)
 
     assert not any("not found by name-based" in note for note in notes)
+
+
+# --- issue #719: cross-namespace inference and orphan scaling -----------------
+
+
+def test_cross_catalog_inference_demotes_confidence_against_same_namespace():
+    """When multiple candidate parents share an entity name, the parent in the
+    child's own namespace (same catalog and schema) is preferred over a
+    cross-catalog candidate (issue #719)."""
+
+    child = _ds(
+        "memory.app.order_items",
+        [_col("order_id", distinct=10, mn=1, mx=10)],
+        rows=10,
+    )
+    same_ns_parent = _ds(
+        "memory.app.orders",
+        [_col("id", distinct=10, unique=True, mn=1, mx=10)],
+        rows=10,
+    )
+    cross_cat_parent = _ds(
+        "iceberg.app.orders",
+        [_col("orderkey", distinct=10, unique=True, mn=1, mx=10)],
+        rows=10,
+    )
+
+    rels = infer_relationships([child, same_ns_parent, cross_cat_parent])
+    by_target = {r.to_dataset: r for r in rels}
+
+    assert "memory.app.orders" in by_target
+    assert "iceberg.app.orders" in by_target
+
+    same_ns_rel = by_target["memory.app.orders"]
+    cross_cat_rel = by_target["iceberg.app.orders"]
+
+    assert same_ns_rel.confidence is not None
+    assert cross_cat_rel.confidence is not None
+    assert same_ns_rel.confidence > cross_cat_rel.confidence
+    assert cross_cat_rel.confidence <= same_ns_rel.confidence - 0.2
+
+
+def test_cross_catalog_inference_prefers_same_catalog_over_different_catalog():
+    """A candidate parent in the same catalog is preferred over a cross-catalog
+    one when several parents share an entity name (issue #719)."""
+
+    child = _ds(
+        "memory.app.order_items",
+        [_col("order_id", distinct=10, mn=1, mx=10)],
+        rows=10,
+    )
+    same_cat_parent = _ds(
+        "memory.analytics.orders",
+        [_col("id", distinct=10, unique=True, mn=1, mx=10)],
+        rows=10,
+    )
+    cross_cat_parent = _ds(
+        "iceberg.app.orders",
+        [_col("orderkey", distinct=10, unique=True, mn=1, mx=10)],
+        rows=10,
+    )
+
+    rels = infer_relationships([child, same_cat_parent, cross_cat_parent])
+    by_target = {r.to_dataset: r for r in rels}
+
+    same_cat_rel = by_target["memory.analytics.orders"]
+    cross_cat_rel = by_target["iceberg.app.orders"]
+
+    assert same_cat_rel.confidence > cross_cat_rel.confidence
+
+
+def test_single_cross_catalog_parent_is_not_penalized_without_rivals():
+    """A cross-catalog parent is not penalized when it is the only candidate
+    for that entity in scope (issue #719)."""
+
+    child = _ds(
+        "memory.app.order_items",
+        [_col("order_id", distinct=10, mn=1, mx=10)],
+        rows=10,
+    )
+    cross_cat_parent = _ds(
+        "iceberg.app.orders",
+        [_col("id", distinct=10, unique=True, mn=1, mx=10)],
+        rows=10,
+    )
+
+    rels = infer_relationships([child, cross_cat_parent])
+    assert len(rels) == 1
+    assert rels[0].confidence == 0.95
+
+
+def test_orphan_findings_at_50_percent_orphans():
+    from exmergo_dex_core.explore.relationships import orphan_findings
+
+    rel = _rel(orphan_fraction=0.50)
+    findings = orphan_findings([rel])
+    assert len(findings) == 1
+    assert "50% of values have no match" in findings[0][1]
+    assert "not evidence of a shared key" in findings[0][1]
+
+
+def test_verify_at_50_percent_orphans_demotes_below_half_and_notes_why(
+    tmp_path: Path, capsys
+):
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "orphans_50.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE customers (id INTEGER, plan VARCHAR)")
+    conn.execute("INSERT INTO customers VALUES (1, 'a')")
+    conn.execute("CREATE TABLE orders (id INTEGER, customer_id INTEGER)")
+    conn.execute("INSERT INTO orders VALUES (10, 1), (11, 7)")
+    conn.close()
+
+    data = _run(["explore", "relationships", "--verify", "--path", str(path)], capsys)[
+        "data"
+    ]
+    rel = next(r for r in data["relationships"] if r["from_columns"] == ["customer_id"])
+    assert rel["verified"] is True
+    assert rel["orphan_fraction"] == 0.5
+    assert rel["confidence"] < 0.5, "measured orphan rate demotes confidence below 0.5"
+    assert any("50% of values have no match" in n for n in data["notes"])
+    assert any("not evidence of a shared key" in n for n in data["notes"])
+
+
+def test_verify_at_75_percent_orphans_demotes_below_half_and_notes_why(
+    tmp_path: Path, capsys
+):
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "orphans_75.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE customers (id INTEGER, plan VARCHAR)")
+    conn.execute("INSERT INTO customers VALUES (1, 'a')")
+    conn.execute("CREATE TABLE orders (id INTEGER, customer_id INTEGER)")
+    conn.execute("INSERT INTO orders VALUES (10, 1), (11, 7), (12, 8), (13, 9)")
+    conn.close()
+
+    data = _run(["explore", "relationships", "--verify", "--path", str(path)], capsys)[
+        "data"
+    ]
+    rel = next(r for r in data["relationships"] if r["from_columns"] == ["customer_id"])
+    assert rel["verified"] is True
+    assert rel["orphan_fraction"] == 0.75
+    assert rel["confidence"] < 0.5, "measured orphan rate demotes confidence below 0.5"
+    assert any("75% of values have no match" in n for n in data["notes"])
+    assert any("not evidence of a shared key" in n for n in data["notes"])

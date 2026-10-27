@@ -244,6 +244,43 @@ def _key_host_counts(keyed: dict[str, list[list[str]]]) -> dict[str, int]:
     return counts
 
 
+def _namespace_parts(identifier: str) -> tuple[str | None, str | None, str]:
+    """Split an identifier into (catalog, schema, table), lowercased."""
+
+    parts = identifier.rsplit(".", 2)
+    if len(parts) == 3:
+        return parts[0].casefold(), parts[1].casefold(), parts[2].casefold()
+    if len(parts) == 2:
+        return None, parts[0].casefold(), parts[1].casefold()
+    return None, None, parts[0].casefold()
+
+
+def _namespace_affinity(child_id: str, parent_id: str) -> int:
+    """Namespace proximity rank between child and parent (0 is closest, 2 is furthest).
+
+    0: same catalog and schema (or same schema when catalog is absent)
+    1: same catalog, different schema
+    2: different catalog or cross-namespace
+    """
+
+    child_cat, child_sch, _ = _namespace_parts(child_id)
+    parent_cat, parent_sch, _ = _namespace_parts(parent_id)
+
+    if child_cat is not None and parent_cat is not None:
+        if child_cat == parent_cat and child_sch == parent_sch:
+            return 0
+        if child_cat == parent_cat:
+            return 1
+        return 2
+
+    if child_sch is not None and parent_sch is not None:
+        if child_sch == parent_sch:
+            return 0
+        return 2
+
+    return 2
+
+
 def infer_relationships(
     datasets: list[Dataset],
     *,
@@ -280,6 +317,7 @@ def infer_relationships(
             stem = fk_stem(col.name)
             if stem is None:
                 continue
+            col_matches: list[tuple[Dataset, list[str], float]] = []
             for parent in datasets:
                 if parent.identifier == child.identifier:
                     continue
@@ -295,16 +333,48 @@ def infer_relationships(
                 )
                 if match is not None:
                     to_columns, confidence = match
-                    relationships.append(
-                        Relationship(
-                            from_dataset=child.identifier,
-                            from_columns=[col.name],
-                            to_dataset=parent.identifier,
-                            to_columns=to_columns,
-                            kind=RelationshipKind.INFERRED,
-                            confidence=confidence,
-                        )
+                    col_matches.append((parent, to_columns, confidence))
+
+            by_entity: dict[str, list[tuple[Dataset, list[str], float]]] = {}
+            for parent, to_columns, confidence in col_matches:
+                ent = entity_of(parent.identifier.rsplit(".", 1)[-1])
+                by_entity.setdefault(ent, []).append((parent, to_columns, confidence))
+
+            for ent_matches in by_entity.values():
+                if len(ent_matches) > 1:
+                    best_affinity = min(
+                        _namespace_affinity(child.identifier, p.identifier)
+                        for p, _, _ in ent_matches
                     )
+                    for parent, to_columns, conf in ent_matches:
+                        affinity = _namespace_affinity(
+                            child.identifier, parent.identifier
+                        )
+                        if affinity > best_affinity:
+                            penalty = 0.25 if affinity == 2 else 0.15
+                            conf = round(max(0.05, conf - penalty), 4)
+                        relationships.append(
+                            Relationship(
+                                from_dataset=child.identifier,
+                                from_columns=[col.name],
+                                to_dataset=parent.identifier,
+                                to_columns=to_columns,
+                                kind=RelationshipKind.INFERRED,
+                                confidence=conf,
+                            )
+                        )
+                else:
+                    for parent, to_columns, conf in ent_matches:
+                        relationships.append(
+                            Relationship(
+                                from_dataset=child.identifier,
+                                from_columns=[col.name],
+                                to_dataset=parent.identifier,
+                                to_columns=to_columns,
+                                kind=RelationshipKind.INFERRED,
+                                confidence=conf,
+                            )
+                        )
     return relationships
 
 
@@ -698,9 +768,9 @@ def key_evidence(dataset: Dataset) -> list[KeyEvidence]:
 # 0.2). At or above it, the two columns are effectively disjoint: a shared
 # name with this little shared data is not a shared key, and joining on it
 # returns all-NULL parent attributes while looking like it worked (issue
-# #207). Set well above the confidence-demotion tier so this fires only for
-# the catastrophic case the issue is about, not every demoted edge.
-_ORPHAN_FINDING_THRESHOLD = 0.9
+# #207, #719). Set at 0.5 so any join with at least 50% orphans reports
+# why its confidence was demoted.
+_ORPHAN_FINDING_THRESHOLD = 0.5
 
 
 def orphan_findings(
@@ -892,6 +962,8 @@ def verify_relationships(
                     confidence += 0.1
                 elif fraction <= 0.02:
                     confidence += 0.05
+                elif fraction >= 0.5:
+                    confidence = min(0.49, confidence * (1.0 - fraction))
                 elif fraction >= 0.2:
                     confidence -= 0.25
                 else:
