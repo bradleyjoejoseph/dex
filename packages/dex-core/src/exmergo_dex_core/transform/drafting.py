@@ -27,14 +27,22 @@ not drafted as non-null.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 import yaml
 
-from ..cache import ColumnProfile, Dataset, DexCache, match_identifier
+from ..cache import (
+    ColumnProfile,
+    Dataset,
+    DexCache,
+    Relationship,
+    match_identifier,
+)
 from ..guards.pii_meta import entry_meta
 from .declarations import DEX_META_KEY, model_sql_path
 
@@ -172,6 +180,7 @@ def draft(
             cache,
             files,
             model_paths,
+            model=model,
             domain_cap=domain_cap,
             cumulative=cumulative,
             cache_note=cache_note,
@@ -443,7 +452,11 @@ class _Lineage:
             self.reading.grain_withheld = evidence
 
         for scope in [*self.ctes.values(), self.tree]:
-            self._collect_usage(scope)
+            if shape.SET_OPERATIONS and isinstance(scope, shape.SET_OPERATIONS):
+                for branch in shape.select_branches(scope):
+                    self._collect_usage(branch)
+            else:
+                self._collect_usage(scope)
 
         # Warehouse relations only, in the order the statement names them.
         # ``range()`` and ``read_csv_auto()`` parse as a table with an empty
@@ -547,6 +560,14 @@ class _Lineage:
         if id(select) in self._outputs:
             return self._outputs[id(select)]
         self._outputs[id(select)] = None  # a cycle reads as unreadable
+        if self.shape.SET_OPERATIONS and isinstance(select, self.shape.SET_OPERATIONS):
+            out = {
+                name.lower(): exp.column(name)
+                for name in getattr(select, "named_selects", [])
+                if name and name != "*"
+            }
+            self._outputs[id(select)] = out or None
+            return self._outputs[id(select)]
         out: dict[str, Any] = {}
         sources = self.sources(select)
         for projection in select.expressions:
@@ -586,6 +607,8 @@ class _Lineage:
         from sqlglot import expressions as exp
 
         if depth > 32:
+            return None
+        if self.shape.SET_OPERATIONS and isinstance(select, self.shape.SET_OPERATIONS):
             return None
         node = expression.this if isinstance(expression, exp.Alias) else expression
         while isinstance(node, exp.Paren):
@@ -659,6 +682,8 @@ class _Lineage:
 
         if depth > 32:
             return [], "the CTE chain is too deep to follow"
+        if self.shape.SET_OPERATIONS and isinstance(select, self.shape.SET_OPERATIONS):
+            return [], "it is a set operation, so no key was carried through it"
         outputs = self.outputs(select)
         if outputs is None:
             return [], "the SELECT list could not be read"
@@ -1022,6 +1047,7 @@ def _drafted(
     domain_cap: int,
     cumulative: Mapping[str, set[str]],
     cache_note: str | None,
+    model: str | None = None,
 ) -> dict[str, Any]:
     drafted: dict[str, Any] = {}
     if reading.grain:
@@ -1032,7 +1058,14 @@ def _drafted(
     columns: dict[str, Any] = {}
     for name, origin in reading.origins.items():
         facts = _column_facts(
-            name, origin, reading, cache, files, model_paths, cumulative=cumulative
+            name,
+            origin,
+            reading,
+            cache,
+            files,
+            model_paths,
+            cumulative=cumulative,
+            model=model,
         )
         if facts:
             columns[name] = facts
@@ -1086,6 +1119,7 @@ def _column_facts(
     model_paths: list[str],
     *,
     cumulative: Mapping[str, set[str]],
+    model: str | None = None,
 ) -> dict[str, Any]:
     dataset = dataset_for(cache, origin.relation)
     profile = _column(dataset, origin.column)
@@ -1099,8 +1133,19 @@ def _column_facts(
         }
     elif dataset is not None and cache is not None:
         reference = _verified_reference(
-            cache, dataset, origin.column, files, model_paths
+            cache, dataset, origin.column, files, model_paths, model=model
         )
+        if model is not None and not _reachable(reference, files, model_paths):
+            # A staging model's column comes from a raw table, whose joins on a
+            # warehouse reach only other raw tables (#892). Once the model is
+            # built, its own relation's joins reach the models beside it.
+            built = dataset_for(cache, model)
+            if built is not None and built is not dataset:
+                own = _verified_reference(
+                    cache, built, name, files, model_paths, model=model
+                )
+                if _reachable(own, files, model_paths):
+                    reference = own
         if reference is not None and reference[0] is not None:
             facts["role"] = {"value": "foreign_key", "evidence": reference[1]}
             facts["references"] = {"value": reference[0], "evidence": reference[1]}
@@ -1168,6 +1213,8 @@ def _verified_reference(
     column: str,
     files: Mapping[str, str],
     model_paths: list[str],
+    *,
+    model: str | None = None,
 ) -> tuple[str | None, str] | None:
     """The reference a verified join supports: ``(target, evidence)``, or
     ``(None, why)`` for a join that was measured and did not hold.
@@ -1176,40 +1223,165 @@ def _verified_reference(
     whose values mostly miss. A declared ``references`` renders a dbt
     ``relationships`` test, which fails on a single orphan, so only a join
     measured with none is drafted as one.
+
+    A column usually joins to several relations once a project is built: the raw
+    table, the staging model over it, and the dimension downstream. Every one is
+    weighed rather than whichever the cache lists first. A parent whose column is
+    measured not unique is no key to reference, and the model itself is no
+    parent. Of the clean joins left, a model of this project comes first (a
+    ``references`` names something ``ref()`` can reach), then a seed or snapshot,
+    then the model nearest this one in the project tree, so a mart references
+    the dimension beside it and a staging model the staging model beside it.
     """
 
-    for edge in cache.relationships:
-        if (
-            not edge.verified
-            or edge.from_dataset != dataset.identifier
-            or len(edge.from_columns) != 1
-            or edge.from_columns[0].lower() != column.lower()
-        ):
-            continue
-        parent = edge.to_dataset.rsplit(".", 1)[-1]
-        target = f"{parent}.{edge.to_columns[0]}"
-        joined = (
+    candidates = [
+        edge
+        for edge in cache.relationships
+        if edge.verified
+        and edge.from_dataset == dataset.identifier
+        and len(edge.from_columns) == 1
+        and edge.from_columns[0].lower() == column.lower()
+    ]
+    if not candidates:
+        return None
+    here = model_sql_path(files, model_paths, model) if model else None
+
+    def joined(edge: Relationship) -> str:
+        return (
             f"the join {dataset.identifier}.{column} -> {edge.to_dataset}."
             f"{edge.to_columns[0]}"
         )
-        if edge.orphan_fraction is None:
-            return None, (
-                f"{joined} was probed with no non-NULL value to match, so it "
+
+    def rank(edge: Relationship) -> tuple[int, int, str]:
+        parent = _project_name(files, model_paths, edge.to_dataset)
+        path = model_sql_path(files, model_paths, parent)
+        if path is not None:
+            kind = 0
+        elif _is_seed_or_snapshot(files, model_paths, parent):
+            kind = 1
+        else:
+            kind = 2
+        shared = 0
+        if path is not None and here is not None:
+            for a, b in zip(
+                PurePosixPath(here).parent.parts,
+                PurePosixPath(path).parent.parts,
+                strict=False,
+            ):
+                if a != b:
+                    break
+                shared += 1
+        return (kind, -shared, parent.lower())
+
+    clean: list[Relationship] = []
+    held: list[str] = []
+    for edge in candidates:
+        parent = edge.to_dataset.rsplit(".", 1)[-1]
+        if model is not None and parent.lower() == model.lower():
+            continue
+        target = next(
+            (d for d in cache.datasets if d.identifier == edge.to_dataset), None
+        )
+        target_column = _column(target, edge.to_columns[0])
+        if target_column is not None and target_column.is_unique is False:
+            held.append(
+                f"{joined(edge)} was verified, but {edge.to_columns[0]} is not "
+                f"unique in {edge.to_dataset}, so it is no key to reference"
+            )
+        elif edge.orphan_fraction is None:
+            held.append(
+                f"{joined(edge)} was probed with no non-NULL value to match, so it "
                 "proves nothing"
             )
-        if edge.orphan_fraction > 0:
-            return None, (
-                f"{joined} was verified with {edge.orphan_fraction:.1%} of its "
+        elif edge.orphan_fraction > 0:
+            held.append(
+                f"{joined(edge)} was verified with {edge.orphan_fraction:.1%} of its "
                 "values unmatched; a relationships test on it would fail"
             )
-        evidence = f"{joined} was verified, no orphans"
-        if model_sql_path(files, model_paths, parent) is None:
-            evidence += (
-                f"; {parent} is not a model of this project, so declare `references` "
-                "only once one stands for it"
-            )
-        return target, evidence
-    return None
+        else:
+            clean.append(edge)
+    if not clean:
+        return (None, held[0]) if held else None
+
+    edge = min(clean, key=rank)
+    parent = _project_name(files, model_paths, edge.to_dataset)
+    parent_column = edge.to_columns[0]
+    if parent != edge.to_dataset.rsplit(".", 1)[-1] and parent_column.isupper():
+        # A warehouse that folds unquoted names to upper case reports the
+        # project's own lower-case model and column in capitals.
+        parent_column = parent_column.lower()
+    target = f"{parent}.{parent_column}"
+    evidence = f"{joined(edge)} was verified, no orphans"
+    if model_sql_path(files, model_paths, parent) is None:
+        evidence += (
+            f"; {parent} is not a model of this project, so declare `references` "
+            "only once one stands for it"
+        )
+    if len(clean) > 1:
+        others = sorted(
+            {e.to_dataset.rsplit(".", 1)[-1] for e in clean if e is not edge}
+        )
+        evidence += f" (also clean: {', '.join(others)})"
+    return target, evidence
+
+
+def _reachable(
+    reference: tuple[str | None, str] | None,
+    files: Mapping[str, str],
+    model_paths: list[str],
+) -> bool:
+    """Whether a drafted reference names something ``ref()`` reaches: a model,
+    seed or snapshot of this project, rather than a raw table."""
+
+    if reference is None or reference[0] is None:
+        return False
+    parent = reference[0].rsplit(".", 1)[0]
+    return model_sql_path(
+        files, model_paths, parent
+    ) is not None or _is_seed_or_snapshot(files, model_paths, parent)
+
+
+def _project_name(
+    files: Mapping[str, str], model_paths: list[str], identifier: str
+) -> str:
+    """The relation ``identifier`` names, spelled as the project spells it.
+
+    Snowflake reports ``STG_CUSTOMERS`` for the model a project writes as
+    ``stg_customers.sql``; a comparison by exact case would miss every model on
+    a warehouse that folds unquoted names to upper case.
+    """
+
+    name = identifier.rsplit(".", 1)[-1]
+    roots = [PurePosixPath(p) for p in model_paths]
+    for path in files:
+        candidate = PurePosixPath(path)
+        if candidate.suffix not in (".sql", ".csv"):
+            continue
+        if candidate.stem.lower() != name.lower():
+            continue
+        if candidate.suffix == ".csv" or any(r in candidate.parents for r in roots):
+            return candidate.stem
+    return name
+
+
+def _is_seed_or_snapshot(
+    files: Mapping[str, str], model_paths: list[str], name: str
+) -> bool:
+    """A seed (``<name>.csv``) or a snapshot block named ``name`` outside the
+    model paths, read from the files alone."""
+
+    roots = [PurePosixPath(p) for p in model_paths]
+    for path, content in files.items():
+        candidate = PurePosixPath(path)
+        if any(root in candidate.parents for root in roots):
+            continue
+        if candidate.suffix == ".csv" and candidate.stem == name:
+            return True
+        if candidate.suffix == ".sql" and re.search(
+            rf"{{%-?\s*snapshot\s+{re.escape(name)}\s*-?%}}", content
+        ):
+            return True
+    return False
 
 
 def _unit_shape(name: str, profile: ColumnProfile) -> tuple[str, str] | None:

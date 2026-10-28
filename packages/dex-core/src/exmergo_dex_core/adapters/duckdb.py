@@ -502,6 +502,29 @@ class DuckDBAdapter:
     def _quote(self, identifier: str) -> str:
         return ".".join(_quote_ident(p) for p in self._split(identifier))
 
+    def describe_query(self, sql: str) -> list[ColumnMeta]:
+        """Output columns of one SELECT, in order, without executing it."""
+
+        assert_select_only(sql, dialect=self.dialect)
+        try:
+            rows = self._conn.execute(f"DESCRIBE ({sql})").fetchall()
+        except Exception as exc:
+            refusal = _refusal(exc)
+            if refusal is None:
+                raise
+            raise refusal from exc
+        columns: list[ColumnMeta] = []
+        for ordinal, row in enumerate(rows):
+            columns.append(
+                ColumnMeta(
+                    name=str(row[0]),
+                    data_type=str(row[1]),
+                    nullable=str(row[2]).upper() == "YES",
+                    ordinal=ordinal,
+                )
+            )
+        return columns
+
     def run_query(
         self,
         sql: str,

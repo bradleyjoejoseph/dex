@@ -901,6 +901,36 @@ def test_relationships_verify_beyond_budget_checkpoints(
     assert cache.relationships and not cache.relationships[0].verified
 
 
+def test_unconfirmed_verify_over_a_fresh_cache_checkpoints_at_the_phase(
+    fk_bq_client, route_adapter, tmp_path
+):
+    """Found dogfooding #892: once every profile is fresh in the cache, nothing
+    is left for the profile handshake to price, so an unconfirmed `--verify`
+    reached its probes unasked. The first probe then asked through the
+    per-statement gate: empty `data`, no hint, and one statement's bytes before
+    the 10 MB floor (110,800 bytes for a phase that billed 178 MB)."""
+
+    route_adapter(fk_bq_client)
+    first = _dispatch(
+        tmp_path,
+        subcommand="relationships",
+        verify=True,
+        confirm=True,
+        budget=float(100 * MB),
+    )
+    assert first.status.value == "ok"
+    fk_bq_client.query_calls.clear()
+
+    envelope = _dispatch(tmp_path, subcommand="relationships", verify=True)
+
+    assert envelope.status.value == "needs_confirmation"
+    assert envelope.data["phase"] == "verify"
+    assert envelope.data["per_table_bytes"] == {"(join overlap probes)": 20 * MB}
+    assert "--budget" in envelope.data["hint"]
+    assert envelope.cost.estimate == 20 * MB
+    assert not _probe_executed(fk_bq_client)
+
+
 def test_verify_with_no_candidates_skips_the_checkpoint(
     fake_bq_client, route_adapter, tmp_path
 ):

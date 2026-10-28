@@ -1357,6 +1357,13 @@ class CostGate:
         ``FREE_LOCAL`` never asks here either (issue #197), even if a numeric
         ceiling happens to be configured for it: the phase spends nothing to
         fit against.
+
+        A command that was never confirmed asks here even when the phase fits.
+        That happens when nothing before the phase needed paying for (every
+        profile `explore relationships --verify` reads was fresh in the
+        cache), so no earlier handshake ran. Admitting the phase there only
+        moved the ask to the first statement, whose bare refusal carried no
+        hint and one statement's unfloored bytes (#892 dogfood).
         """
 
         self.session_ratio()  # the history read, outside the lock
@@ -1364,10 +1371,8 @@ class CostGate:
             ceiling = self.admission_ceiling()
             needed = self._estimated + estimate
             cost = self._cost(needed)
-            if (
-                self.paradigm is not Paradigm.FREE_LOCAL
-                and ceiling is not None
-                and needed > ceiling
+            if self.paradigm is not Paradigm.FREE_LOCAL and (
+                not self.confirmed or (ceiling is not None and needed > ceiling)
             ):
                 raise ConfirmationRequiredError(cost)
             self._note_calibrated_admission(needed)

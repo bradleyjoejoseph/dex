@@ -76,7 +76,8 @@ class PlanResult(Result):
     decisions: list[dict[str, Any]] | None = None
     # Per model the plan creates, edits or declares: what dex drafted from the
     # cache and the SQL, what the post-change YAML declares, and which intent
-    # fields nobody has supplied. A draft is offered, never written. Absent when
+    # fields nobody has supplied. A plan offers a draft and never writes it
+    # (`transform declare` writes part of one, when asked). Absent when
     # the plan touches no model.
     declarations: dict[str, dict[str, Any]] | None = None
     # The semantic model derived from each declared mart the plan touches
@@ -174,6 +175,38 @@ class PlacementResult(PlanResult):
         # `--explain` stores nothing, so there are no plan fields to report and
         # an empty `plan_id` would read as a plan that failed to store.
         return payload if self.explained else {**payload, **super().data()}
+
+
+class DeclareResult(PlanResult):
+    """Declarations proposed for models that already exist (#501).
+
+    Every selected model is accounted for: proposed (``proposed``, each with the
+    measured facts written and their evidence), skipped (``skipped``, each with
+    its reason), or past the cap (``elided_count``, also stated in ``notes``).
+    With nothing to propose no plan is stored, and the plan fields are omitted
+    rather than empty, so an empty ``plan_id`` never reads as a plan that failed
+    to store.
+    """
+
+    selector: list[str] = Field(default_factory=list)
+    selected_count: int = 0
+    proposed: list[dict[str, Any]] = Field(default_factory=list)
+    skipped: list[dict[str, Any]] = Field(default_factory=list)
+    elided_count: int = 0
+
+    always_reports_notes: ClassVar[bool] = True
+
+    def data(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "selector": self.selector,
+            "selected_count": self.selected_count,
+            "proposed": self.proposed,
+            "skipped": self.skipped,
+            "elided_count": self.elided_count,
+        }
+        if not self.plan_id:
+            return {**payload, "plan_id": None}
+        return {**payload, **super().data()}
 
 
 class MacroListResult(Result):

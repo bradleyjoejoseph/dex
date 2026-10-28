@@ -496,6 +496,42 @@ def test_a_time_spine_alone_is_a_note(tmp_path: Path):
     assert result.suppressed["row_population"] == generated
 
 
+def test_a_model_whose_final_cte_is_a_union_is_suppressed_with_reason(tmp_path: Path):
+    sql = (
+        "with named as (select 1 as id), "
+        "residual as (select 2 as id), "
+        "combined as ( "
+        "    select id from named "
+        "    union all "
+        "    select id from residual "
+        ") "
+        "select * from combined"
+    )
+    _artifacts(
+        tmp_path,
+        nodes={
+            "model.shop.fct_daily": {
+                "name": "fct_daily",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."fct_daily"',
+                "compiled_code": sql,
+            }
+        },
+        results=[{"unique_id": "model.shop.fct_daily", "status": "success"}],
+    )
+    result = _sweep(
+        tmp_path,
+        _summary([_node("model.shop.fct_daily")]),
+        _StubAdapter([]),
+    )
+    assert "row_population" in result.suppressed
+    assert (
+        "it is driven by a set operation, so it has no single parent"
+        in result.suppressed["row_population"]
+    )
+    assert not any("nothing built at combined" in w for w in result.warnings)
+
+
 # --- the payload --------------------------------------------------------------
 
 

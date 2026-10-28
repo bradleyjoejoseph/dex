@@ -1008,7 +1008,7 @@ class Adapter(Protocol):
     open handle and the raw-data access, so nothing leaks past the engine. The
     agent only ever sees the sanitized envelope.
 
-    Two optional methods, found with ``getattr`` rather than declared here so a
+    Optional methods, found with ``getattr`` rather than declared here so a
     host-supplied adapter that has not grown them still satisfies the protocol:
 
     - ``forget_metadata()``: an adapter that caches what it listed (scope
@@ -1028,6 +1028,11 @@ class Adapter(Protocol):
       separate probes over one table each pay (#275). Both return ``None``
       where the table cannot be probed in one statement; the caller then issues
       the separate probes exactly as it would without the pair.
+    - ``describe_query(sql)``: output columns of one SELECT, in order, without
+      executing it. Returns a list of :class:`ColumnMeta`. Reading a query's
+      output schema is metadata, and ``DESCRIBE`` is not a SELECT
+      ``run_query`` can re-assert, so it stays on the adapter. An adapter
+      without it leaves a refactor comparison unchecked.
     """
 
     #: Stable connector name, e.g. "duckdb", "snowflake".

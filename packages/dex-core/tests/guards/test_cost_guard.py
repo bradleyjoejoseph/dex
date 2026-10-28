@@ -193,6 +193,19 @@ def test_gate_phase_beyond_remaining_headroom_asks_for_confirmation():
     assert exc_info.value.cost.paradigm is Paradigm.BYTES_SCANNED
 
 
+def test_gate_phase_on_an_unconfirmed_command_asks_even_when_it_fits():
+    # Found dogfooding #892 on BigQuery: with every profile fresh in the cache,
+    # `explore relationships --verify` reached the verify phase with no earlier
+    # handshake, the phase fit the committed ceiling, and the first probe then
+    # asked through the per-statement gate with no hint and one statement's
+    # unfloored bytes. An unconfirmed command asks at the phase instead.
+    gate = _gate(confirmed=False)
+    with pytest.raises(ConfirmationRequiredError) as exc_info:
+        gate.preflight_phase(300.0)
+    assert exc_info.value.cost.estimate == 300.0
+    assert exc_info.value.cost.ceiling == 1_000.0
+
+
 def test_gate_phase_session_remainder_binds_when_tighter():
     gate = _gate(ceiling=1_000.0, session_ceiling=800.0, session_spent=500.0)
     with pytest.raises(ConfirmationRequiredError) as exc_info:

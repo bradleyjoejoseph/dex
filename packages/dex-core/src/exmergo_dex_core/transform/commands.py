@@ -54,6 +54,7 @@ from .results import (
     ApplyResult,
     BuildResult,
     ClassificationResult,
+    DeclareResult,
     DepsResult,
     GroundingResult,
     InitResult,
@@ -594,10 +595,6 @@ def _draft(
     exception rather than a plan that fails to exist.
     """
 
-    from ..adapters import get_dialect
-    from ..cache import mask_overridden
-    from ..explore.cumulative import cumulative_columns
-    from ..storage import CacheUnreadableError
     from . import declarations as declarations_mod
     from . import drafting
 
@@ -613,6 +610,31 @@ def _draft(
     if not models:
         return {}, []
 
+    try:
+        return drafting.draft(
+            models,
+            files,
+            view.model_paths,
+            **_drafting_inputs(engine, view),
+            index=lambda: _post_change_index(view, edits),
+            prior={path: source.content for path, source in view.files.items()},
+        )
+    except Exception as exc:
+        return {}, [
+            f"could not draft the declarations of this plan's models "
+            f"({type(exc).__name__}: {exc}); the plan itself is unaffected"
+        ]
+
+
+def _drafting_inputs(engine: DexEngine, view: Any) -> dict[str, Any]:
+    """What :func:`drafting.draft` reads besides the project: the cache, with
+    ``pii_overrides`` applied, and the settings it drafts under. Opens nothing."""
+
+    from ..adapters import get_dialect
+    from ..cache import mask_overridden
+    from ..explore.cumulative import cumulative_columns
+    from ..storage import CacheUnreadableError
+
     note = None
     try:
         cache = readable_cache(engine.store)
@@ -622,28 +644,17 @@ def _draft(
         note = "there is no exploration cache yet; run `explore map` first"
     if cache is not None:
         cache = mask_overridden(cache, pii_override_paths(engine.config.pii_overrides))
-    try:
-        return drafting.draft(
-            models,
-            files,
-            view.model_paths,
-            cache,
-            dialect=get_dialect(engine.connector or engine.config.connector),
-            vars=view.vars,
-            domain_cap=engine.config.profile_value_domain_cap,
-            cumulative={
-                dataset.identifier: cumulative_columns(dataset.data_quality)
-                for dataset in (cache.datasets if cache is not None else [])
-            },
-            cache_note=note,
-            index=lambda: _post_change_index(view, edits),
-            prior={path: source.content for path, source in view.files.items()},
-        )
-    except Exception as exc:
-        return {}, [
-            f"could not draft the declarations of this plan's models "
-            f"({type(exc).__name__}: {exc}); the plan itself is unaffected"
-        ]
+    return {
+        "cache": cache,
+        "dialect": get_dialect(engine.connector or engine.config.connector),
+        "vars": view.vars,
+        "domain_cap": engine.config.profile_value_domain_cap,
+        "cumulative": {
+            dataset.identifier: cumulative_columns(dataset.data_quality)
+            for dataset in (cache.datasets if cache is not None else [])
+        },
+        "cache_note": note,
+    }
 
 
 def _post_change_index(view: Any, edits: list[PlanEdit]) -> Any:
@@ -965,6 +976,168 @@ def cmd_place(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             if result.plan_id
             else None
         )
+        return to_envelope(result, hints=hints)
+    except DbtParseError as exc:
+        return env.error_for(exc, warnings=exc.warnings)
+    except ValueError as exc:
+        return env.error_for(exc)
+
+
+def declare(
+    engine: DexEngine,
+    objects: list[str] | None = None,
+    *,
+    declarations: list[Any] | None = None,
+    edits: list[PlanEdit] | None = None,
+    limit: int | None = None,
+    intent: str | None = None,
+) -> DeclareResult:
+    """``transform declare``: propose declarations for models that already exist.
+
+    The selector is the one ``maintain verify`` takes: model names, repeatable
+    and comma-separated, none for the whole project. Each selected model gets the
+    measured facts its YAML does not yet state (see :mod:`.declare`), laid under
+    whatever the payload's ``declarations`` supply, and the lot is stored as one
+    ordinary plan through :func:`plan`, so it is rendered, parsed and drafted
+    exactly as a hand-written declaration would be. Repository and cache only.
+    """
+
+    from ..dbt_project import load as load_project
+    from . import declarations as declarations_mod
+    from . import declare as declare_mod
+    from . import drafting
+
+    if edits:
+        raise ValueError(
+            "transform declare writes declarations into model YAML and takes no "
+            "`edits`; pass SQL or other file changes to `transform plan`, which "
+            "takes `declarations` beside them"
+        )
+    if limit is not None and not 1 <= limit <= declare_mod.MAX_MODELS:
+        raise ValueError(
+            f"--limit {limit} is outside 1 to {declare_mod.MAX_MODELS}; the cap of "
+            f"{declare_mod.MAX_MODELS} models per plan keeps the diff reviewable, "
+            "and --limit can only narrow it"
+        )
+    cap = declare_mod.MAX_MODELS if limit is None else limit
+    supplied = declarations_mod.parse_declarations(declarations)
+    if not _has_dbt_project(engine):
+        raise declarations_mod.DeclarationError(
+            "transform declare writes declarations into a dbt project's model YAML, "
+            "and no dbt project is the editable project here"
+        )
+
+    project = engine.project_dir()
+    view = load_project(project)
+    selector = [
+        name for raw in objects or [] for name in raw.split(",") if name.strip()
+    ]
+    selection = declare_mod.select_models(view, selector, Path(project))
+    selected = {m.lower() for m in selection.models}
+    outside = [d.model for d in supplied if d.model.lower() not in selected]
+    if outside:
+        named = {s["model"].lower(): s for s in selection.skipped}
+        reasons = [
+            f"'{m}' ({named[m.lower()]['detail']})" if m.lower() in named else f"'{m}'"
+            for m in outside
+        ]
+        raise declarations_mod.DeclarationError(
+            "the payload declares "
+            + ", ".join(reasons)
+            + ", which the selector does not select; add "
+            + ("it" if len(outside) == 1 else "them")
+            + " to the selector, or drop the selector to select every model"
+        )
+    if len(supplied) > cap:
+        raise ValueError(
+            f"the payload declares {len(supplied)} models and this plan is capped at "
+            f"{cap}; split the payload across plans"
+        )
+
+    files = {path: source.content for path, source in view.files.items()}
+    inputs = _drafting_inputs(engine, view)
+
+    def draft_one(model: str) -> tuple[dict[str, Any] | None, list[str]]:
+        try:
+            drafts, warnings = drafting.draft(
+                [model], files, view.model_paths, **inputs
+            )
+        except Exception as exc:
+            return None, [f"could not draft '{model}' ({type(exc).__name__}: {exc})"]
+        return drafts.get(model), warnings
+
+    outcome = declare_mod.propose(
+        view, selection.models, supplied, draft=draft_one, cap=cap
+    )
+    skipped = selection.skipped + outcome.skipped
+    notes: list[str] = []
+    if outcome.elided:
+        notes.append(
+            f"{len(outcome.elided)} selected model(s) were not considered: this plan "
+            f"is capped at {cap} proposed models. Apply it and run the same command "
+            "again for the next batch (models already declared are skipped and do "
+            "not count), or narrow the selector"
+        )
+    common: dict[str, Any] = {
+        "selector": selector,
+        "selected_count": len(selection.models)
+        + sum(1 for s in selection.skipped if s["reason"] == "versioned"),
+        "proposed": [p.as_dict() for p in outcome.proposals],
+        "skipped": skipped,
+        "elided_count": len(outcome.elided),
+    }
+    if not outcome.proposals:
+        notes.append(
+            "nothing to propose, so no plan was stored; every selected model is "
+            "listed under `skipped` with the reason"
+        )
+        return DeclareResult(notes=notes, **common)
+
+    payload = [
+        p.declaration.model_dump(mode="json", exclude_none=True, exclude_defaults=True)
+        | {"model": p.model}
+        for p in outcome.proposals
+    ]
+    names = [p.model for p in outcome.proposals]
+    planned = plan(
+        engine,
+        intent
+        or (
+            "declare existing model"
+            + ("s " if len(names) > 1 else " ")
+            + ", ".join(names[:5])
+            + (f" and {len(names) - 5} more" if len(names) > 5 else "")
+        ),
+        declarations=payload,
+        attribute_rows=False,
+    )
+    return DeclareResult(
+        plan_id=planned.plan_id,
+        intent=planned.intent,
+        paths=planned.paths,
+        plan_path=planned.plan_path,
+        diffs=planned.diffs,
+        warnings=planned.warnings,
+        decisions=planned.decisions,
+        declarations=planned.declarations,
+        semantic_proposal=planned.semantic_proposal,
+        notes=notes + planned.notes,
+        **common,
+    )
+
+
+def cmd_declare(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    try:
+        edits, declarations = payload_from_file(getattr(args, "edits_file", None))
+        result = declare(
+            engine,
+            getattr(args, "objects", None),
+            declarations=declarations,
+            edits=edits,
+            limit=getattr(args, "limit", None),
+            intent=getattr(args, "intent", None),
+        )
+        hints = plan_hint(result) if result.plan_id else None
         return to_envelope(result, hints=hints)
     except DbtParseError as exc:
         return env.error_for(exc, warnings=exc.warnings)

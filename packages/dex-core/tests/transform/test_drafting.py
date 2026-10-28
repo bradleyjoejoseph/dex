@@ -293,6 +293,194 @@ def test_a_verified_join_with_orphans_is_withheld_as_a_reference():
     assert "100.0% of its values unmatched" in column["references"]["withheld"]
 
 
+def _edge(to: str, column: str, orphans: float | None = 0.0) -> Relationship:
+    return Relationship(
+        from_dataset=ORDERS.identifier,
+        from_columns=["customer_id"],
+        to_dataset=to,
+        to_columns=[column],
+        kind=RelationshipKind.INFERRED,
+        verified=True,
+        orphan_fraction=orphans,
+    )
+
+
+def _project_draft(cache: DexCache, model: str = "fct") -> dict:
+    """``model`` in ``models/marts`` reading stg_orders, beside a dimension and a
+    staging model over the same customers."""
+
+    files = {
+        f"models/marts/{model}.sql": (
+            "select order_id, customer_id from {{ ref('stg_orders') }}\n"
+        ),
+        "models/marts/dim_customers.sql": "select id from {{ ref('stg_customers') }}\n",
+        "models/staging/stg_customers.sql": (
+            "select id from {{ source('raw', 'customers') }}\n"
+        ),
+    }
+    drafts, _ = draft([model], files, ["models"], cache, dialect="duckdb")
+    return drafts[model]["drafted"]["columns"]["customer_id"]
+
+
+def test_a_reference_prefers_a_project_model_and_the_one_nearest_the_model():
+    # Found dogfooding #501: once the project is built, a column joins cleanly to
+    # the raw table, its staging model and the dimension. The first edge listed
+    # used to win, which proposed `references` to a raw table no `ref()` reaches.
+    cache = CACHE.model_copy(deep=True)
+    cache.datasets += [
+        Dataset(identifier="warehouse.main.stg_customers", columns=[_key("id")]),
+        Dataset(identifier="warehouse.main.dim_customers", columns=[_key("id")]),
+    ]
+    cache.relationships += [
+        _edge("warehouse.main.stg_customers", "id"),
+        _edge("warehouse.main.dim_customers", "id"),
+    ]
+
+    column = _project_draft(cache)
+
+    assert column["references"]["value"] == "dim_customers.id"
+    assert "also clean: customers, stg_customers" in column["references"]["evidence"]
+
+
+def test_a_reference_skips_a_parent_whose_column_is_not_unique_and_the_model_itself():
+    cache = CACHE.model_copy(deep=True)
+    cache.relationships = [
+        _edge("warehouse.main.fct", "customer_id"),
+        _edge("warehouse.main.stg_items", "order_id"),
+    ]
+    cache.datasets[2] = Dataset(
+        identifier="warehouse.main.stg_items",
+        columns=[_col("order_id", "integer", is_unique=False)],
+    )
+
+    column = _project_draft(cache)
+
+    assert "role" not in column
+    assert column["references"]["value"] is None
+    assert "not unique in warehouse.main.stg_items" in column["references"]["withheld"]
+
+
+def test_a_reference_finds_the_project_model_a_folding_warehouse_reports_in_capitals():
+    # Found dogfooding #501 on Snowflake: `DEX_501.STG_CUSTOMERS` is the model
+    # the project writes as `stg_customers.sql`, and an exact-case lookup took it
+    # for a relation no `ref()` reaches.
+    cache = CACHE.model_copy(deep=True)
+    cache.datasets.append(
+        Dataset(
+            identifier="DB.DEX_501.STG_CUSTOMERS",
+            columns=[_key("ID")],
+        )
+    )
+    cache.relationships = [_edge("DB.DEX_501.STG_CUSTOMERS", "ID")]
+
+    column = _project_draft(cache)
+
+    assert column["references"]["value"] == "stg_customers.id"
+    assert "not a model of this project" not in column["references"]["evidence"]
+
+
+def test_a_clean_join_wins_over_an_orphaned_one_listed_first():
+    cache = CACHE.model_copy(deep=True)
+    cache.datasets.append(
+        Dataset(identifier="warehouse.main.dim_customers", columns=[_key("id")])
+    )
+    cache.relationships = [
+        _edge("warehouse.main.dim_customers", "id", orphans=0.2),
+        _edge("warehouse.main.customers", "id"),
+    ]
+
+    column = _project_draft(cache)
+
+    assert column["role"]["value"] == "foreign_key"
+    assert column["references"]["value"] == "customers.id"
+
+
+def _staging_draft(cache: DexCache) -> dict:
+    """A staging model over a raw table, beside a staging model over the
+    customers that table's foreign key names."""
+
+    files = {
+        "models/staging/stg_payments.sql": (
+            "select payment_id, customer_id from {{ source('raw', 'payments') }}\n"
+        ),
+        "models/staging/stg_customers.sql": (
+            "select id from {{ source('raw', 'customers') }}\n"
+        ),
+    }
+    drafts, _ = draft(["stg_payments"], files, ["models"], cache, dialect="duckdb")
+    return drafts["stg_payments"]["drafted"]["columns"]["customer_id"]
+
+
+def _payments_cache(*, built: bool) -> DexCache:
+    """Raw sources in `raw` and the build in `dbt_dev`, as on every warehouse
+    (#892): the raw foreign key joins only the raw parent."""
+
+    def payments(identifier: str) -> Dataset:
+        return Dataset(
+            identifier=identifier,
+            columns=[
+                _key("payment_id"),
+                _col("customer_id", "integer", null_fraction=0.0),
+            ],
+        )
+
+    datasets = [
+        payments("warehouse.raw.payments"),
+        Dataset(identifier="warehouse.raw.customers", columns=[_key("id")]),
+    ]
+    relationships = [
+        Relationship(
+            from_dataset="warehouse.raw.payments",
+            from_columns=["customer_id"],
+            to_dataset="warehouse.raw.customers",
+            to_columns=["id"],
+            kind=RelationshipKind.INFERRED,
+            verified=True,
+            orphan_fraction=0.0,
+        )
+    ]
+    if built:
+        datasets += [
+            payments("warehouse.dbt_dev.stg_payments"),
+            Dataset(identifier="warehouse.dbt_dev.stg_customers", columns=[_key("id")]),
+        ]
+        relationships.append(
+            Relationship(
+                from_dataset="warehouse.dbt_dev.stg_payments",
+                from_columns=["customer_id"],
+                to_dataset="warehouse.dbt_dev.stg_customers",
+                to_columns=["id"],
+                kind=RelationshipKind.INFERRED,
+                verified=True,
+                orphan_fraction=0.0,
+            )
+        )
+    return DexCache(datasets=datasets, relationships=relationships)
+
+
+def test_a_built_staging_model_references_the_model_its_own_relation_joins():
+    # Found dogfooding #892: a staging model's column comes from a raw table,
+    # whose joins on a warehouse reach only the raw parent, so the draft
+    # proposed a foreign key with no `references`. The model's own built
+    # relation joins the staging model beside it, and that is the reference.
+    column = _staging_draft(_payments_cache(built=True))
+
+    assert column["role"]["value"] == "foreign_key"
+    assert column["references"]["value"] == "stg_customers.id"
+    assert (
+        "warehouse.dbt_dev.stg_payments.customer_id -> "
+        "warehouse.dbt_dev.stg_customers.id" in column["references"]["evidence"]
+    )
+
+
+def test_an_unbuilt_staging_model_keeps_the_raw_join_as_evidence():
+    column = _staging_draft(_payments_cache(built=False))
+
+    assert column["role"]["value"] == "foreign_key"
+    assert column["references"]["value"] == "customers.id"
+    assert "not a model of this project" in column["references"]["evidence"]
+
+
 # --- value domains ------------------------------------------------------------------
 
 
@@ -776,3 +964,73 @@ def test_a_plan_that_touches_no_model_carries_no_declarations(shop, capsys):
     )
 
     assert "declarations" not in envelope["data"]
+
+
+def test_a_cte_whose_body_is_a_union_is_not_read_as_a_physical_relation():
+    import sqlglot
+
+    from exmergo_dex_core.transform.drafting import _Lineage, _Reading
+
+    sql = (
+        "with named as (select order_id, amount from raw_orders), "
+        "residual as (select order_id, amount from archived_orders), "
+        "combined as ( "
+        "    select order_id, amount from named "
+        "    union all "
+        "    select order_id, amount from residual "
+        ") "
+        "select combined.order_id, combined.amount, c.region "
+        "from combined "
+        "cross join configured "
+        "left join customers c on combined.order_id = c.customer_id"
+    )
+    tree = sqlglot.parse_one(sql, read="duckdb")
+    reading = _Reading()
+    lineage = _Lineage(tree, {}, None, reading)
+    lineage.run()
+    assert "combined" not in reading.relations
+    assert "named" not in reading.relations
+    assert "residual" not in reading.relations
+    assert set(reading.relations) == {
+        "raw_orders",
+        "archived_orders",
+        "configured",
+        "customers",
+    }
+
+
+def test_plan_does_not_name_union_cte_as_unprofiled_relation(shop, capsys):
+    repo, warehouse = shop
+    model_sql = (
+        "with named as (\n"
+        "    select order_id, amount from {{ source('raw', 'raw_orders') }}\n"
+        "), residual as (\n"
+        "    select order_id, amount from {{ source('raw', 'raw_orders') }}\n"
+        "), combined as (\n"
+        "    select order_id, amount from named\n"
+        "    union all\n"
+        "    select order_id, amount from residual\n"
+        ")\n"
+        "select combined.order_id, combined.amount, c.region\n"
+        "from combined\n"
+        "left join {{ source('raw', 'customers') }} c\n"
+        "    on combined.order_id = c.customer_id\n"
+    )
+    envelope = _plan(
+        repo,
+        warehouse,
+        {
+            "edits": [
+                {
+                    "path": "models/marts/fct_daily.sql",
+                    "kind": "model_sql",
+                    "content": model_sql,
+                }
+            ]
+        },
+        capsys,
+    )
+
+    # Drafting should not report 'combined' as an unprofiled relation.
+    assert not any("combined" in w for w in envelope.get("warnings", []))
+    assert "fct_daily" in envelope["data"]["declarations"]

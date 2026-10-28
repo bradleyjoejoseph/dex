@@ -38,8 +38,43 @@ from sqlglot import expressions as exp
 #: CTEs without colliding with a real CTE name.
 MAIN_SCOPE = "(final select)"
 
+# Built by name at import, the way the guards build theirs, because sqlglot
+# collapsed the three set-operation classes under one base between majors and
+# both shapes are inside the supported range. A class that is not there in the
+# installed version simply drops out of the tuple.
+SET_OPERATIONS = tuple(
+    c
+    for c in (
+        getattr(exp, "SetOperation", None),
+        getattr(exp, "Union", None),
+        getattr(exp, "Intersect", None),
+        getattr(exp, "Except", None),
+    )
+    if isinstance(c, type)
+)
 
-def scopes(tree: exp.Expression) -> dict[str, exp.Select]:
+
+def select_branches(tree: exp.Expression | None) -> list[exp.Select]:
+    """Flatten a statement across any set operations into its constituent SELECTs.
+
+    A single SELECT returns ``[tree]``. A UNION, INTERSECT or EXCEPT returns the
+    list of all its branch SELECTs in order, so a caller walking joins, usages,
+    or fragments across a compound statement inspects each branch independently.
+    """
+
+    if tree is None:
+        return []
+    if isinstance(tree, exp.Select):
+        return [tree]
+    if SET_OPERATIONS and isinstance(tree, SET_OPERATIONS):
+        left = select_branches(tree.this) if tree.this is not None else []
+        right_side = tree.args.get("expression")
+        right = select_branches(right_side) if right_side is not None else []
+        return left + right
+    return []
+
+
+def scopes(tree: exp.Expression) -> dict[str, exp.Expression]:
     """Every scope whose shape can move rows: each top-level CTE, plus the final
     select.
 
@@ -48,14 +83,16 @@ def scopes(tree: exp.Expression) -> dict[str, exp.Select]:
     can silently pair the wrong pair of scopes is worse than declining to align.
     """
 
-    found: dict[str, exp.Select] = {}
+    found: dict[str, exp.Expression] = {}
     with_clause = tree.args.get("with_") or tree.args.get("with")
     if with_clause is not None:
         for cte in with_clause.expressions:
-            if isinstance(cte.this, exp.Select):
-                found[cte.alias_or_name.lower()] = cte.this
-    if isinstance(tree, exp.Select):
-        found[MAIN_SCOPE] = tree
+            body = cte.this.unnest() if hasattr(cte.this, "unnest") else cte.this
+            if isinstance(body, (exp.Select, *SET_OPERATIONS)):
+                found[cte.alias_or_name.lower()] = body
+    body = tree.unnest() if hasattr(tree, "unnest") else tree
+    if isinstance(body, (exp.Select, *SET_OPERATIONS)):
+        found[MAIN_SCOPE] = body
     return found
 
 
@@ -190,21 +227,6 @@ def group_by(select: exp.Select) -> list[str]:
     group = select.args.get("group")
     return [] if group is None else [text(e) for e in group.expressions]
 
-
-# Built by name at import, the way the guards build theirs, because sqlglot
-# collapsed the three set-operation classes under one base between majors and
-# both shapes are inside the supported range. A class that is not there in the
-# installed version simply drops out of the tuple.
-SET_OPERATIONS = tuple(
-    c
-    for c in (
-        getattr(exp, "SetOperation", None),
-        getattr(exp, "Union", None),
-        getattr(exp, "Intersect", None),
-        getattr(exp, "Except", None),
-    )
-    if isinstance(c, type)
-)
 
 #: Constructs that turn one input row into several by design. A query holding
 #: one has an honest reason to be larger than the relation it reads, so a caller
@@ -364,9 +386,11 @@ def conjunctive_equality_pairs(
     return pairs or None
 
 
-def from_relation(select: exp.Select) -> exp.Expression | None:
+def from_relation(select: exp.Expression | None) -> exp.Expression | None:
     """The driving relation: what the FROM clause names, before any join."""
 
+    if not isinstance(select, exp.Select):
+        return None
     clause = select.args.get("from_") or select.args.get("from")
     return None if clause is None else clause.this
 

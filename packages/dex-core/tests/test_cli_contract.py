@@ -744,6 +744,17 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
             "explain": "explain",
         },
     },
+    ("transform", "declare"): {
+        "method": "declare",
+        "args": {
+            "objects": "models",
+            # The payload file is read by the shim; the engine takes its
+            # `declarations` list.
+            "edits_file": _TRANSLATED,
+            "limit": "limit",
+            "intent": "intent",
+        },
+    },
     ("transform", "test"): {
         "reason": (
             "two modes on one verb: --mutate is DexEngine.test_mutations (with "

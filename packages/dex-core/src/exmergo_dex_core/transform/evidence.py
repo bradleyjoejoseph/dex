@@ -672,13 +672,20 @@ def build_evidence(
     edits: list[PlanEdit] | None = None,
     plan_digest: str | None = None,
     source_digest: str | None = None,
+    artifact_directory: Path | str | None = None,
+    expected_invocation_id: str | None = None,
 ) -> BuildEvidence:
     """Read dbt's own artifacts and say what this build established.
 
-    Reads ``target/run_results.json`` and ``target/manifest.json`` rather than
-    scraping log text, exactly as :func:`~.build._summarize` does, and reads them
-    separately from it on purpose: ``summary`` is a released payload shape and
-    nothing here may move it.
+    Reads ``run_results.json`` and ``manifest.json`` from ``artifact_directory``
+    (default ``<project>/target``) rather than scraping log text, exactly as
+    :func:`~.build._summarize` does, and reads them separately from it on
+    purpose. ``summary`` is a released payload shape and nothing here may move
+    it.
+
+    ``expected_invocation_id``, when set, refuses artifacts whose invocation id
+    is a different id. A missing file has no id to disagree with and stays
+    ``not_run`` rather than a successful completion.
     """
 
     from ..dbt_project import load as load_project
@@ -688,10 +695,22 @@ def build_evidence(
         node_name,
         strip_relation_quoting,
     )
+    from .artifact_runtime import (
+        artifact_paths,
+        artifact_producer,
+        assert_same_invocation,
+    )
 
     root = Path(project)
-    run_results_path = root / "target" / "run_results.json"
-    manifest_path = root / "target" / "manifest.json"
+    if artifact_directory is None:
+        chosen = root / "target"
+    else:
+        chosen = Path(artifact_directory)
+        if not chosen.is_absolute():
+            chosen = root / chosen
+    paths = artifact_paths(chosen)
+    run_results_path = paths.run_results
+    manifest_path = paths.manifest
 
     results: list[dict[str, Any]] = []
     metadata: dict[str, Any] = {}
@@ -787,6 +806,32 @@ def build_evidence(
     except Exception:
         stale = None
 
+    producer = artifact_producer(
+        project_root=root,
+        target=target,
+        artifact_directory=paths.directory,
+        metadata=metadata if isinstance(metadata, dict) else {},
+        project_name=(
+            str(manifest.get("metadata", {}).get("project_name"))
+            if isinstance(manifest.get("metadata"), dict)
+            and manifest.get("metadata", {}).get("project_name")
+            else None
+        ),
+        adapter_version=(
+            str(metadata["adapter_version"])
+            if isinstance(metadata, dict) and metadata.get("adapter_version")
+            else None
+        ),
+    )
+    assert_same_invocation(
+        expected_invocation_id,
+        (
+            str(metadata["invocation_id"])
+            if isinstance(metadata, dict) and metadata.get("invocation_id")
+            else None
+        ),
+    )
+
     return BuildEvidence(
         outcome=_outcome(ran, nodes, coverage, stale, drift),
         invocation={
@@ -797,6 +842,7 @@ def build_evidence(
             "command": "build",
             "target": target,
             "select": select,
+            "artifact_producer": producer.as_dict(),
             # dbt writes this at the top of run_results, not inside `metadata`.
             "elapsed_seconds": (
                 float(elapsed)

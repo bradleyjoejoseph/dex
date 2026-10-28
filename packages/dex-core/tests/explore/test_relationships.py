@@ -588,6 +588,10 @@ def _mirror_world(dev_schema: str = "dbt_dev") -> list[Dataset]:
     ]
 
 
+def _edges(rels: list[Relationship]) -> set[tuple[str, str]]:
+    return {(r.from_dataset, r.to_dataset) for r in rels}
+
+
 def test_replica_dataset_duplicate_edges_are_folded():
     datasets = _mirror_world()
     rels = infer_relationships(datasets)
@@ -596,11 +600,13 @@ def test_replica_dataset_duplicate_edges_are_folded():
     kept, folded, mirrored = fold_replica_relationships(
         datasets, rels, frozenset({"dbt_dev"})
     )
-    assert folded == 3
-    assert len(kept) == 1
-    # The kept edge is the source-schema one, named by the dev_dataset config.
-    assert kept[0].from_dataset == "db.main.orders"
-    assert kept[0].to_dataset == "db.main.customers"
+    # The two cross-schema lookalikes go; each schema keeps its own join, since
+    # the dev one is the join a built model can declare (#892).
+    assert folded == 2
+    assert _edges(kept) == {
+        ("db.main.orders", "db.main.customers"),
+        ("db.dbt_dev.stg_orders", "db.dbt_dev.dim_customers"),
+    }
     assert mirrored == 2  # the two dbt_dev objects
 
 
@@ -608,10 +614,13 @@ def test_fold_detects_mirror_structurally_without_config():
     datasets = _mirror_world()
     rels = infer_relationships(datasets)
     kept, folded, mirrored = fold_replica_relationships(datasets, rels)
-    # No dev_schemas passed: structural mirror detection still collapses the
-    # duplicates (canonical chosen deterministically).
-    assert folded == 3
-    assert len(kept) == 1
+    # No dev_schemas passed: structural mirror detection still folds the
+    # cross-schema lookalikes.
+    assert folded == 2
+    assert _edges(kept) == {
+        ("db.main.orders", "db.main.customers"),
+        ("db.dbt_dev.stg_orders", "db.dbt_dev.dim_customers"),
+    }
     assert mirrored == 2
 
 
@@ -635,34 +644,154 @@ def test_fold_is_a_noop_without_a_mirror():
 
 def test_fold_matches_qualified_dev_dataset_config():
     """A BigQuery-style qualified dev_dataset (`project.dataset`) must still mark
-    the replica schema, so the source edge is kept as canonical."""
+    the replica schema, so the cross-schema lookalikes are folded."""
 
     datasets = _mirror_world()
     rels = infer_relationships(datasets)
     kept, folded, mirrored = fold_replica_relationships(
         datasets, rels, frozenset({"db.dbt_dev"})
     )
-    assert folded == 3
-    assert len(kept) == 1
-    assert kept[0].from_dataset == "db.main.orders"
-    assert kept[0].to_dataset == "db.main.customers"
+    assert folded == 2
+    assert _edges(kept) == {
+        ("db.main.orders", "db.main.customers"),
+        ("db.dbt_dev.stg_orders", "db.dbt_dev.dim_customers"),
+    }
     assert mirrored == 2
 
 
 def test_fold_matches_dev_schema_case_insensitively():
     """A lower-case configured dev_schema must match an upper-cased warehouse
-    schema (Snowflake/Redshift casing), keeping the source edge as canonical."""
+    schema (Snowflake/Redshift casing), so the cross-schema lookalikes fold."""
 
     datasets = _mirror_world(dev_schema="DBT_DEV")
     rels = infer_relationships(datasets)
     kept, folded, mirrored = fold_replica_relationships(
         datasets, rels, frozenset({"dbt_dev"})
     )
-    assert folded == 3
-    assert len(kept) == 1
-    assert kept[0].from_dataset == "db.main.orders"
-    assert kept[0].to_dataset == "db.main.customers"
+    assert folded == 2
+    assert _edges(kept) == {
+        ("db.main.orders", "db.main.customers"),
+        ("db.DBT_DEV.stg_orders", "db.DBT_DEV.dim_customers"),
+    }
     assert mirrored == 2
+
+
+def _built_world(raw: str = "shop", dev: str = "dex_dev") -> list[Dataset]:
+    """Raw sources in one schema and a dbt build in another, the shape of every
+    warehouse dogfood of #501: the mart has no raw twin, and its parent exists
+    as the raw table, the staging model over it and the dimension downstream."""
+
+    def customers(identifier: str) -> Dataset:
+        return _ds(
+            identifier,
+            [_col("customer_id", distinct=5, unique=True), _col("name", "VARCHAR")],
+            rows=5,
+        )
+
+    return [
+        customers(f"db.{raw}.customers"),
+        _ds(
+            f"db.{raw}.orders",
+            [
+                _col("order_id", distinct=9, unique=True),
+                _col("customer_id", distinct=4),
+            ],
+            rows=9,
+        ),
+        customers(f"db.{dev}.stg_customers"),
+        customers(f"db.{dev}.dim_customers"),
+        _ds(
+            f"db.{dev}.fct_customer_spend",
+            [
+                _col("order_id", distinct=9, unique=True),
+                _col("customer_id", distinct=4),
+                _col("cumulative_spend", "DOUBLE"),
+            ],
+            rows=9,
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("raw", "dev", "configured"),
+    [("shop", "dex_dev", "dex_dev"), ("SHOP501", "DEX_501", "dex_501")],
+)
+def test_fold_keeps_a_built_foreign_key_joined_to_the_built_parent(
+    raw: str, dev: str, configured: str
+):
+    """#892: with sources and the build in different schemas, a built foreign
+    key used to keep only its join to the raw table, so no `references` could
+    be drafted on a warehouse. It keeps the built parents beside it now, and a
+    raw foreign key still keeps the raw parent."""
+
+    datasets = _built_world(raw, dev)
+    rels = infer_relationships(datasets)
+    kept, folded, _mirrored = fold_replica_relationships(
+        datasets, rels, frozenset({configured})
+    )
+    from_mart = {
+        r.to_dataset
+        for r in kept
+        if r.from_dataset == f"db.{dev}.fct_customer_spend"
+        and r.from_columns == ["customer_id"]
+    }
+    assert from_mart == {f"db.{dev}.stg_customers", f"db.{dev}.dim_customers"}
+    from_raw = {
+        r.to_dataset
+        for r in kept
+        if r.from_dataset == f"db.{raw}.orders" and r.from_columns == ["customer_id"]
+    }
+    assert from_raw == {f"db.{raw}.customers"}
+    # Nothing in the source schema points into the build: raw `orders` has its
+    # own parent, and raw `customers` is a copy of the built ones, not a child.
+    assert not [
+        r
+        for r in kept
+        if r.from_dataset.startswith(f"db.{raw}.")
+        and r.to_dataset.startswith(f"db.{dev}.")
+        and r.from_columns == ["customer_id"]
+    ]
+    assert folded > 0
+
+
+def test_fold_does_not_depend_on_which_schema_reads_as_the_source():
+    """With no dev schema configured, the mirror is detected structurally and
+    the schema with more tables is taken as canonical, which on a built project
+    is often the build. The result must not change with that choice."""
+
+    datasets = _built_world()
+    datasets.append(
+        _ds("db.dex_dev.rpt_spend", [_col("customer_id", distinct=4)], rows=4)
+    )
+    rels = infer_relationships(datasets)
+    kept, folded, _mirrored = fold_replica_relationships(datasets, rels)
+    assert folded > 0
+    from_mart = {
+        r.to_dataset
+        for r in kept
+        if r.from_dataset == "db.dex_dev.fct_customer_spend"
+        and r.from_columns == ["customer_id"]
+    }
+    assert from_mart == {"db.dex_dev.stg_customers", "db.dex_dev.dim_customers"}
+    assert ("db.shop.orders", "db.shop.customers") in _edges(kept)
+    assert ("db.shop.customers", "db.dex_dev.stg_customers") not in _edges(kept)
+
+
+def test_fold_keeps_a_cross_schema_join_with_no_same_schema_twin():
+    """A built foreign key whose parent was never built keeps its join to the
+    raw table: nothing nearer stands for it, so the evidence is not dropped."""
+
+    datasets = [
+        d
+        for d in _built_world()
+        if not d.identifier.endswith(("stg_customers", "dim_customers"))
+    ]
+    rels = infer_relationships(datasets)
+    kept, folded, _mirrored = fold_replica_relationships(
+        datasets, rels, frozenset({"dex_dev"})
+    )
+    assert ("db.dex_dev.fct_customer_spend", "db.shop.customers") in _edges(kept)
+    assert folded == 0
 
 
 def test_map_folds_mirrored_lineage_and_notes_it(tmp_path: Path, capsys):
@@ -686,8 +815,8 @@ def test_map_folds_mirrored_lineage_and_notes_it(tmp_path: Path, capsys):
         ["explore", "map", "--path", str(db), "--repo-root", str(repo)], capsys
     )
     assert any("mirror source lineage" in n for n in payload["data"]["notes"])
-    # One real foreign key survives instead of the inflated cross-schema fan-out.
-    assert payload["data"]["relationship_count"] <= 2
+    # Each schema's own join survives; the cross-schema lookalikes do not.
+    assert payload["data"]["relationship_count"] == 2
 
 
 def test_relationships_folds_mirrored_lineage_and_persists_folded_set(
@@ -714,21 +843,32 @@ def test_relationships_folds_mirrored_lineage_and_persists_folded_set(
     repo = tmp_path / "repo"
     repo.mkdir()
     payload = _run(
-        ["explore", "relationships", "--path", str(db), "--repo-root", str(repo)],
+        [
+            "explore",
+            "relationships",
+            "--path",
+            str(db),
+            "--repo-root",
+            str(repo),
+            "--verify",
+        ],
         capsys,
     )
     data = payload["data"]
     assert any("mirror source lineage" in n for n in data["notes"])
-    # One real foreign key survives instead of the inflated cross-schema fan-out.
-    assert len(data["relationships"]) == 1
+    # Each schema keeps its own join and the cross-schema lookalikes are
+    # folded, so the dev join a built model can declare is measured too (#892).
+    edges = {(r["from_dataset"], r["to_dataset"]): r for r in data["relationships"]}
+    assert set(edges) == {
+        ("mirror.main.orders", "mirror.main.customers"),
+        ("mirror.dbt_dev.stg_orders", "mirror.dbt_dev.dim_customers"),
+    }
+    built = edges[("mirror.dbt_dev.stg_orders", "mirror.dbt_dev.dim_customers")]
+    assert built["verified"] is True
+    assert built["orphan_fraction"] == 0.0
 
     cache = FilesystemStore(repo).load_cache()
-    assert len(cache.relationships) == 1
-    envelope_edge = data["relationships"][0]
-    assert (cache.relationships[0].from_dataset, cache.relationships[0].to_dataset) == (
-        envelope_edge["from_dataset"],
-        envelope_edge["to_dataset"],
-    )
+    assert {(r.from_dataset, r.to_dataset) for r in cache.relationships} == set(edges)
 
 
 # --- grain and data-quality notes ----------------------------------------------
@@ -1297,19 +1437,20 @@ def _rel(
     ("rel", "expect_finding"),
     [
         (_rel(orphan_fraction=1.0), True),
-        (_rel(orphan_fraction=0.9), True),  # exactly at the threshold
-        # The existing heavy-orphan demotion case: a real signal, but not
-        # catastrophic enough for this finding -- a different tier.
-        (_rel(orphan_fraction=0.6), False),
+        (_rel(orphan_fraction=0.9), True),
+        (_rel(orphan_fraction=0.6), True),  # above the 0.5 threshold (issue #719)
+        (_rel(orphan_fraction=0.5), True),  # exactly at the 0.5 threshold
+        (_rel(orphan_fraction=0.4), False),  # below 0.5: demoted, not finding
         (_rel(orphan_fraction=0.0), False),
         (_rel(orphan_fraction=None), False),  # verified but nothing measured
         (_rel(verified=False, orphan_fraction=1.0), False),  # nothing measured
         # Issue #163: a declared join is probed now, so it reaches this
         # decision at all. It qualifies on the same measured threshold as an
-        # inferred one -- see the wording split below for why it is not the
+        # inferred one: see the wording split below for why it is not the
         # same finding.
         (_rel(kind=RelationshipKind.DECLARED, orphan_fraction=1.0), True),
-        (_rel(kind=RelationshipKind.DECLARED, orphan_fraction=0.6), False),
+        (_rel(kind=RelationshipKind.DECLARED, orphan_fraction=0.6), True),
+        (_rel(kind=RelationshipKind.DECLARED, orphan_fraction=0.4), False),
         (
             _rel(kind=RelationshipKind.DECLARED, verified=False, orphan_fraction=1.0),
             False,
@@ -2384,3 +2525,147 @@ def test_an_edge_inference_also_found_is_not_reported_as_rescued():
     notes = _semantic_join_notes(semantic, 0, inferred)
 
     assert not any("not found by name-based" in note for note in notes)
+
+
+# --- issue #719: cross-namespace inference and orphan scaling -----------------
+
+
+def test_cross_catalog_inference_demotes_confidence_against_same_namespace():
+    """When multiple candidate parents share an entity name, the parent in the
+    child's own namespace (same catalog and schema) is preferred over a
+    cross-catalog candidate (issue #719)."""
+
+    child = _ds(
+        "memory.app.order_items",
+        [_col("order_id", distinct=10, mn=1, mx=10)],
+        rows=10,
+    )
+    same_ns_parent = _ds(
+        "memory.app.orders",
+        [_col("id", distinct=10, unique=True, mn=1, mx=10)],
+        rows=10,
+    )
+    cross_cat_parent = _ds(
+        "iceberg.app.orders",
+        [_col("orderkey", distinct=10, unique=True, mn=1, mx=10)],
+        rows=10,
+    )
+
+    rels = infer_relationships([child, same_ns_parent, cross_cat_parent])
+    by_target = {r.to_dataset: r for r in rels}
+
+    assert "memory.app.orders" in by_target
+    assert "iceberg.app.orders" in by_target
+
+    same_ns_rel = by_target["memory.app.orders"]
+    cross_cat_rel = by_target["iceberg.app.orders"]
+
+    assert same_ns_rel.confidence is not None
+    assert cross_cat_rel.confidence is not None
+    assert same_ns_rel.confidence > cross_cat_rel.confidence
+    assert cross_cat_rel.confidence <= same_ns_rel.confidence - 0.2
+
+
+def test_cross_catalog_inference_prefers_same_catalog_over_different_catalog():
+    """A candidate parent in the same catalog is preferred over a cross-catalog
+    one when several parents share an entity name (issue #719)."""
+
+    child = _ds(
+        "memory.app.order_items",
+        [_col("order_id", distinct=10, mn=1, mx=10)],
+        rows=10,
+    )
+    same_cat_parent = _ds(
+        "memory.analytics.orders",
+        [_col("id", distinct=10, unique=True, mn=1, mx=10)],
+        rows=10,
+    )
+    cross_cat_parent = _ds(
+        "iceberg.app.orders",
+        [_col("orderkey", distinct=10, unique=True, mn=1, mx=10)],
+        rows=10,
+    )
+
+    rels = infer_relationships([child, same_cat_parent, cross_cat_parent])
+    by_target = {r.to_dataset: r for r in rels}
+
+    same_cat_rel = by_target["memory.analytics.orders"]
+    cross_cat_rel = by_target["iceberg.app.orders"]
+
+    assert same_cat_rel.confidence > cross_cat_rel.confidence
+
+
+def test_single_cross_catalog_parent_is_not_penalized_without_rivals():
+    """A cross-catalog parent is not penalized when it is the only candidate
+    for that entity in scope (issue #719)."""
+
+    child = _ds(
+        "memory.app.order_items",
+        [_col("order_id", distinct=10, mn=1, mx=10)],
+        rows=10,
+    )
+    cross_cat_parent = _ds(
+        "iceberg.app.orders",
+        [_col("id", distinct=10, unique=True, mn=1, mx=10)],
+        rows=10,
+    )
+
+    rels = infer_relationships([child, cross_cat_parent])
+    assert len(rels) == 1
+    assert rels[0].confidence == 0.95
+
+
+def test_orphan_findings_at_50_percent_orphans():
+    from exmergo_dex_core.explore.relationships import orphan_findings
+
+    rel = _rel(orphan_fraction=0.50)
+    findings = orphan_findings([rel])
+    assert len(findings) == 1
+    assert "50% of values have no match" in findings[0][1]
+    assert "not evidence of a shared key" in findings[0][1]
+
+
+def test_verify_at_50_percent_orphans_demotes_below_half_and_notes_why(
+    tmp_path: Path, capsys
+):
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "orphans_50.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE customers (id INTEGER, plan VARCHAR)")
+    conn.execute("INSERT INTO customers VALUES (1, 'a')")
+    conn.execute("CREATE TABLE orders (id INTEGER, customer_id INTEGER)")
+    conn.execute("INSERT INTO orders VALUES (10, 1), (11, 7)")
+    conn.close()
+
+    data = _run(["explore", "relationships", "--verify", "--path", str(path)], capsys)[
+        "data"
+    ]
+    rel = next(r for r in data["relationships"] if r["from_columns"] == ["customer_id"])
+    assert rel["verified"] is True
+    assert rel["orphan_fraction"] == 0.5
+    assert rel["confidence"] < 0.5, "measured orphan rate demotes confidence below 0.5"
+    assert any("50% of values have no match" in n for n in data["notes"])
+    assert any("not evidence of a shared key" in n for n in data["notes"])
+
+
+def test_verify_at_75_percent_orphans_demotes_below_half_and_notes_why(
+    tmp_path: Path, capsys
+):
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "orphans_75.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE customers (id INTEGER, plan VARCHAR)")
+    conn.execute("INSERT INTO customers VALUES (1, 'a')")
+    conn.execute("CREATE TABLE orders (id INTEGER, customer_id INTEGER)")
+    conn.execute("INSERT INTO orders VALUES (10, 1), (11, 7), (12, 8), (13, 9)")
+    conn.close()
+
+    data = _run(["explore", "relationships", "--verify", "--path", str(path)], capsys)[
+        "data"
+    ]
+    rel = next(r for r in data["relationships"] if r["from_columns"] == ["customer_id"])
+    assert rel["verified"] is True
+    assert rel["orphan_fraction"] == 0.75
+    assert rel["confidence"] < 0.5, "measured orphan rate demotes confidence below 0.5"
+    assert any("75% of values have no match" in n for n in data["notes"])
+    assert any("not evidence of a shared key" in n for n in data["notes"])

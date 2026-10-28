@@ -1206,7 +1206,9 @@ def relationships(
         notes.append(
             f"folded {folded_edges} same-lineage duplicate relationship(s); "
             f"{mirrored_objects} object(s) mirror source lineage (a dev/replica "
-            "dataset mapped alongside its source)"
+            "dataset mapped alongside its source), so each foreign key keeps its "
+            "join to the parent in its own schema and drops the same join to a "
+            "parent of that entity in another"
         )
     notes.extend(_generic_name_notes(suppressed))
     notes.extend(_affix_match_notes(affix_matches))
@@ -2681,7 +2683,9 @@ def map(
         notes.append(
             f"folded {folded_edges} same-lineage duplicate relationship(s); "
             f"{mirrored_objects} object(s) mirror source lineage (a dev/replica "
-            "dataset mapped alongside its source)"
+            "dataset mapped alongside its source), so each foreign key keeps its "
+            "join to the parent in its own schema and drops the same join to a "
+            "parent of that entity in another"
         )
     notes.extend(_generic_name_notes(suppressed))
     notes.extend(_affix_match_notes(affix_matches))

@@ -82,6 +82,9 @@ COMMAND_SURFACE: dict[str, list[str]] = {
         "rename",
         "remove",
         "place",
+        # Declarations for models that already exist (#501): opt-in, one capped
+        # plan per call, repo-and-cache only.
+        "declare",
         "test",
         # The host boundary (#441): a plan a second process can carry and check,
         # what that plan depends on, what its edits actually contain, and what
@@ -386,6 +389,13 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
         "Find the lowest common model that can define the column for every "
         "target, define it there, and thread it down. --explain stores no "
         "plan. Repo-only and free.",
+    ),
+    ("transform", "declare"): (
+        "propose declarations for models that already exist",
+        "Store one plan proposing the measured facts (grain, keys, joins, "
+        "running totals) each selected model does not yet declare, plus any "
+        "intent the --edits-file declarations supply. Capped at 25 models; "
+        "every skipped model is named. Repo-only and free.",
     ),
     ("transform", "test"): (
         "scaffold a unit test, or mutation-test existing tests",
@@ -1214,6 +1224,35 @@ def _build_parser() -> argparse.ArgumentParser:
                         default=False,
                         help="return the reasoning without storing a plan",
                     )
+                if group == "transform" and name == "declare":
+                    # The selector `maintain verify` takes: model names, repeated
+                    # or comma-separated; none selects every model.
+                    sp.add_argument(
+                        "objects",
+                        nargs="*",
+                        metavar="model",
+                        help="model to declare (default: every model in the project)",
+                    )
+                    sp.add_argument(
+                        "--edits-file",
+                        default=None,
+                        metavar="FILE",
+                        help="payload whose `declarations` supply intent for the plan",
+                    )
+                    # Only ever narrows, like --max-mutants: the ceiling is what
+                    # keeps a project-wide selector a diff somebody can review.
+                    sp.add_argument(
+                        "--limit",
+                        type=int,
+                        default=None,
+                        metavar="N",
+                        help="propose at most N models (can only lower the cap of 25)",
+                    )
+                    sp.add_argument(
+                        "--intent",
+                        default=None,
+                        help="one line saying what the plan is for",
+                    )
                 if group == "transform" and name == "test":
                     # Two modes, and they are opposites: `--scaffold` writes a
                     # unit test, `--mutate` measures the tests that already
@@ -1528,6 +1567,7 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         ("transform", "rename"): "cmd_rename",
         ("transform", "remove"): "cmd_remove",
         ("transform", "place"): "cmd_place",
+        ("transform", "declare"): "cmd_declare",
         ("transform", "test"): "cmd_test",
         ("transform", "export"): "cmd_export",
         ("transform", "ground"): "cmd_ground",

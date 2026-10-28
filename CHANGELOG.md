@@ -14,6 +14,74 @@ pending fragments into a new section below. See
 
 <!-- towncrier release notes start -->
 
+## [1.16.4] - 2026-10-28
+
+### Added
+
+- **`transform declare` proposes declarations for models that already exist.**
+  Select models the way `maintain verify` does (names, or none for every model),
+  and one plan proposes the facts dex measured that each model's YAML does not
+  yet state: the grain, `key` and `foreign_key` roles, a `references` to a model
+  of the project, and `semi_additive` for a running total. Intent supplied in the
+  same `declarations` payload rides in the same plan. Fields a model already
+  declares are never touched, so a second run after apply proposes nothing. Every
+  model it skips is named with the reason, including the `explore profile` command
+  for inputs the cache has not profiled. At most 25 models per plan; `--limit`
+  narrows it. Free on every connector.
+
+### Fixed
+
+- **CTEs containing set operations are recognized in plan drafting and model verification.**
+  A model whose driving relation or CTE body is a `UNION` or other set operation is no longer treated as reading an unprofiled physical warehouse relation. Plan drafting does not warn that the CTE is an unprofiled relation, and verification suppresses row population with an explicit note explaining that the model has no single driving parent rather than reporting an unbuilt relation with zero findings. ([#878](https://github.com/exmergo/dex/pull/878))
+- **`maintain snapshot --project-only` reports `data.baseline.carried_forward: true`.**
+  Running `maintain snapshot --project-only` previously reported `false` because
+  the parameter was dropped when instantiating the baseline model. It is now passed
+  directly to the result envelope. In addition, `FilesystemStore` writes documents
+  atomically via a temporary file in `.dex/` and `os.replace`, and static type
+  checking with `mypy` and the Pydantic plugin now runs over `maintain/` and
+  `storage/` in CI. ([#881](https://github.com/exmergo/dex/pull/881))
+- **Per-runtime dbt artifact isolation.** Build evidence records sanitized `artifact_producer` metadata and reads `run_results.json` and `manifest.json` from the directory the build wrote. The policy is runtime isolation. A clean shared `target/` is reused. A cross-runtime snapshot path collision isolates or refuses without deleting caller-owned artifacts, and `dbt build` receives that directory as `--target-path`. A foreign invocation id cannot come back as a successful completion. ([#883](https://github.com/exmergo/dex/pull/883))
+- **`maintain verify` reads correctly when additivity is suppressed.** The reason no longer says "there is no an entity to order it by", and models dropped for the same reason are named once in a single entry, as in "no declaration could be checked (8 models: a, b, ...)", instead of the reason being repeated for each model. ([#886](https://github.com/exmergo/dex/pull/886))
+- **`explore relationships` prefers candidate parents in the child's namespace.**
+  When multiple candidate parents share an entity name, inference now prefers the
+  parent in the child's own namespace (same catalog and schema, then same catalog)
+  and lowers cross-catalog confidence. Verified joins with at least 50% orphans
+  scale confidence below 0.5 and emit an explanatory note stating that the shared
+  column name is not evidence of a shared key. ([#888](https://github.com/exmergo/dex/pull/888))
+- **`explore profile` proves keys on Postgres views and tables nobody has analyzed.** On Postgres, a view (which `pg_stats` never describes) or a table built but never analyzed reported no distinct counts, so profiling came back with an unknown grain and no candidate keys even when a key was really there. Profiling now measures distinct counts for null-free columns with an exact scan inside the already confirmed budget, so a key that holds is proven, and the note says the counts were measured because the catalog had none instead of claiming they are unavailable until ANALYZE runs. ([#900](https://github.com/exmergo/dex/pull/900))
+- **A built foreign key joins the built parent beside it on every warehouse.**
+  With the sources in one schema and the dbt build in another, `explore
+  relationships` and `explore map` folded every foreign key's joins down to the one
+  pointing at the raw table, so a mart's `customer_id` never joined `stg_customers`
+  or `dim_customers`, and `transform plan` and `transform declare` could draft no
+  `references` off DuckDB. Each foreign key now keeps its join to the parent in its
+  own schema, and the fold drops only the same join across schemas and joins
+  between copies of one entity in different schemas. A staging model, whose
+  columns come from raw tables, now takes its `references` from its own built
+  relation's joins once it is built and profiled, so `stg_orders.customer_id`
+  references `stg_customers` on a warehouse as it already did on DuckDB.
+- **A declaration no longer crashes on a column that already lists tests.**
+  Declaring a grain, `null_rule: never` or `references` on a column whose
+  `tests:` list was written one item per line failed with an import error instead
+  of adding the new test beneath the existing ones.
+- **A drafted `references` picks the right parent.** Once a project is built, a
+  column joins cleanly to the raw table, its staging model and the dimension
+  downstream, and the draft used to take whichever join the cache listed first.
+  It could propose a reference to a raw table no `ref()` reaches, to a model whose
+  column is not unique, or to the model itself, and an orphaned join listed first
+  hid a clean one. The draft now passes over a non-unique parent and the model
+  itself, prefers a model of the project (the nearest one in the project tree),
+  and names the other clean parents in its evidence. On Snowflake, a model
+  reported as `STG_CUSTOMERS` is recognised as the project's `stg_customers`.
+- **An unconfirmed `--verify` over a fresh cache asks with the real estimate.**
+  On a metered connector, when every profile `explore relationships --verify` or
+  `explore map --verify` needed was already fresh in the cache, nothing before the
+  overlap probes asked for confirmation, so the first probe asked instead. That
+  request carried no hint and no breakdown, and quoted one statement's bytes
+  before BigQuery's 10 MB minimum: 110,800 bytes for probes that billed 178 MB.
+  The verify checkpoint now asks first, with the whole phase priced.
+
+
 ## [1.16.3] - 2026-10-27
 
 ### Added

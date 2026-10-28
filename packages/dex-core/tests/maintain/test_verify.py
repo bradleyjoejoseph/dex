@@ -3519,3 +3519,61 @@ def test_maintain_verify_target_dev_reads_dev_namespace(tmp_path: Path):
     assert data_dev["target"] == "dev"
     assert data_dev["manifest_target"] == "dev"
     assert data_dev["judged_namespace"] == "dbt_dev"
+
+
+def test_a_model_whose_final_cte_is_a_union_is_unfollowable_not_unbuilt(tmp_path: Path):
+    sql = (
+        'with named as (select * from "wh"."main"."named"), '
+        'residual as (select * from "wh"."main"."residual"), '
+        "combined as ( "
+        "    select * from named "
+        "    union all "
+        "    select * from residual "
+        ") "
+        "select * from combined "
+        'cross join "wh"."main"."configured" '
+        'left join "wh"."main"."lookup" on combined.key = lookup.key'
+    )
+    nodes = {
+        "m.1": _model("fct_daily", sql),
+    }
+    checks, notes = _plan(tmp_path, nodes)
+    assert checks == []
+    assert len(notes) == 1
+    assert (
+        "no single driving parent could be identified for fct_daily "
+        "(it is driven by a set operation, so it has no single parent)"
+    ) in notes[0]
+
+
+def test_verify_suppression_when_model_is_driven_by_union_cte(
+    maintain_repo, _assume_the_project_compiles
+):
+    sql = (
+        "with named as (select 1 as id), "
+        "residual as (select 2 as id), "
+        "combined as ( "
+        "    select id from named "
+        "    union all "
+        "    select id from residual "
+        ") "
+        "select * from combined"
+    )
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.fct_daily": {
+                "name": "fct_daily",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."fct_daily"',
+                "compiled_code": sql,
+            }
+        },
+        results=[],
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    suppressed = payload["data"]["suppressed"]["row_population"]
+    assert "it is driven by a set operation, so it has no single parent" in suppressed
+    warnings = payload.get("warnings", [])
+    assert not any("nothing built at combined" in w for w in warnings)

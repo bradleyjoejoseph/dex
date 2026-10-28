@@ -259,6 +259,25 @@ dex transform place <column>      -> where a derived column shared by several mo
                                      `per_target` and the reason is stated rather than the worse thing
                                      being done quietly. --explain returns the reasoning and stores no
                                      plan. Repo-only and free
+dex transform declare [<model>]   -> declarations for models that already exist, opt-in. One stored
+  [--edits-file <f>] [--limit N]     plan proposing, per selected model, only the measured facts its
+  [--intent "<text>"]                YAML does not state: the grain, a key or foreign_key role, a
+                                     references to a model/seed/snapshot of this project, and
+                                     semi_additive for a running total, each under data.proposed with
+                                     its evidence. Selector as `maintain verify` (names, repeatable,
+                                     comma-separated; none = every model), read from the repo alone.
+                                     A declared field is never proposed, so a second run after apply
+                                     is a no-op. Unit shape, NULL facts, PII and value domains stay
+                                     evidence in data.declarations.<model>.drafted; intent stays in
+                                     missing unless the payload's declarations supply it (they win
+                                     field by field; edits are refused). Every model not proposed is
+                                     in data.skipped with a reason (not_a_model, python_model,
+                                     versioned, sql_unreadable, unprofiled_inputs + the profile
+                                     command, nothing_drafted, complete, not_writable). Capped at 25
+                                     proposals (--limit only narrows); skipped models do not count,
+                                     the rest are data.elided_count and a note. Nothing to propose
+                                     stores no plan (plan_id null). Rendered, parse-gated and stored as
+                                     a transform plan declaration. Repo-and-cache only and free
 dex transform build --target dev  -> cost preflight FIRST; runs only with --confirm and a budget;
              [--verify]              auto-runs dbt deps when packages are declared but not installed.
              [--for-plan <id>]       --verify sweeps the nodes this build ran for correctness and
@@ -353,9 +372,10 @@ dex maintain snapshot [--project-only]
                                   -> capture/refresh the known-good baseline in .dex/snapshot.json;
                                      --project-only re-fingerprints only project layers and carries the
                                      existing warehouse baseline and its timestamps forward without opening
-                                     a warehouse connection; each model's declaration (descriptions and
-                                     config.meta.dex, per model and per column) is fingerprinted as one
-                                     hash per field, counted in transform_layer.declared_model_count
+                                     a warehouse connection, reporting data.baseline.carried_forward: true;
+                                     each model's declaration (descriptions and config.meta.dex, per model
+                                     and per column) is fingerprinted as one hash per field, counted in
+                                     transform_layer.declared_model_count
 dex maintain check                -> sweep every drift axis vs the snapshot; ranked report (read-only;
                                      two-phase on billed connectors: free axes now, one estimate for scans)
 dex maintain schema [<objects>]   -> structural drift: columns/tables added, dropped, retyped, renamed;
@@ -458,7 +478,11 @@ schemas, the metric-input check and dbt's parse of a throwaway copy is added to 
 same plan; in one without, nothing is added and the object is ready to pass to
 `semantic plan --definitions-file`. The parse is never skipped for a derivation,
 whatever `--no-parse` says. A command that takes no declarations refuses a payload
-carrying them rather than dropping them. The full shape, the refusals and
+carrying them rather than dropping them. `transform declare [<model>...]` takes the
+same payload for models that already exist: it proposes only the measured facts
+each selected model does not yet declare, lays the supplied `declarations` over
+them field by field, and stores the lot as one capped plan, naming every model it
+skipped and why. The full shape, the refusals and
 what each field renders into:
 [`skills/transform/references/declarations.md`](../skills/transform/references/declarations.md).
 
@@ -1224,6 +1248,18 @@ field-by-field catalog contract, the two backends' declared asymmetries, and wha
 inferred join with one aggregate overlap probe (non-null foreign keys, orphan
 count) and adjusts its confidence; the result carries `verified` and
 `orphan_fraction`.
+
+When a dev or replica schema is in scope beside its sources (the connector's
+configured dev namespace, or a schema that mirrors another's entities and
+columns), inference finds every foreign key twice over: once inside each schema
+and once across them. Both commands keep each foreign key's join to the parent
+in its own schema and fold the same join to a parent of that entity in another
+schema, along with every cross-schema join between two tables of one entity
+(raw `customers` and the built `stg_customers` are copies, not a parent and its
+child). A built
+model's foreign key therefore keeps its join to the built parent beside it, which
+is the one a declaration can `ref()`, and keeps a join to the raw table only when
+nothing was built for that entity. The notes count what was folded.
 
 Exploration starts bare: by default the warehouse is observed as-is, and a dbt
 project in the repo earns only a discovery note. `explore profile`,

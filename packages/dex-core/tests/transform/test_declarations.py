@@ -194,6 +194,26 @@ def test_a_single_column_grain_is_tested_unique_and_not_null():
     ]
 
 
+def test_a_grain_extends_a_block_style_test_list_in_place():
+    # Found dogfooding #501: an existing block list took the `block_end` path,
+    # whose import had moved, so every such declaration crashed.
+    [declaration] = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
+    text = (
+        "version: 2\nmodels:\n  - name: fct_orders\n    columns:\n"
+        "      - name: order_id\n        tests:\n          - unique\n"
+        "      - name: amount\n"
+    )
+
+    out = render(text, declaration)
+
+    assert out == (
+        "version: 2\nmodels:\n  - name: fct_orders\n    config:\n      meta:\n"
+        "        dex:\n          grain:\n            - order_id\n    columns:\n"
+        "      - name: order_id\n        tests:\n          - unique\n"
+        "          - not_null\n      - name: amount\n"
+    )
+
+
 def test_a_composite_grain_is_declared_but_not_tested():
     [declaration] = parse_declarations(
         [{"model": "fct_orders", "grain": ["order_id", "status"]}]

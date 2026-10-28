@@ -802,9 +802,9 @@ def _add_tests(text: str, locate, specs: list[Any]) -> str:
         )
     dash_indent = line[: len(line) - len(line.lstrip(" "))]
     last_key_line = text.rfind("\n", 0, listed.value[-1].start_mark.index) + 1
-    from .rewrite import _block_end
+    from ..yaml_spans import block_end
 
-    end = _block_end(text, last_key_line, len(dash_indent))
+    end = block_end(text, last_key_line, len(dash_indent))
     at = before_trailing_blanks(text, end)
     rendered = "".join(_render_item(spec, dash_indent) for spec in todo)
     prefix = "" if at == 0 or text[at - 1] == "\n" else "\n"

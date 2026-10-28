@@ -9,7 +9,9 @@ whitelist, so a misconfigured ``dbt_target: prod`` still refuses.
 dbt runs as a subprocess rather than in-process: dbt logs to stdout, and the
 command contract is exactly one JSON envelope there, so the run is isolated and
 only a sanitized summary crosses the boundary. Node results come from dbt's own
-``target/run_results.json`` artifact, not from scraping log text.
+``run_results.json`` in the artifact directory for this build, not from
+scraping log text. That directory is ``<project>/target`` unless the caller
+named a runtime or an artifact directory.
 """
 
 from __future__ import annotations
@@ -43,6 +45,12 @@ from ..dbt_project import load as load_project
 from ..envelope import Cost, EstimateQuality, Paradigm, redact
 from ..errors import DexError, PrerequisiteError
 from ..guards.cost_guard import preflight
+from .artifact_runtime import (
+    artifact_paths,
+    clear_run_results,
+    prepare_artifact_dir,
+    sanitize_artifact_directory,
+)
 
 # Names that mean production no matter what the config says. The build target
 # must additionally be on the allowlist (dev or the configured dbt_target); this
@@ -123,6 +131,8 @@ def build(
     timeout: float = _DBT_TIMEOUT_SECONDS,
     dependencies: DependencyPolicy = DependencyPolicy.INSTALL,
     approved_functions: frozenset[str] | None = None,
+    runtime_key: str | None = None,
+    artifact_directory: Path | str | None = None,
 ) -> tuple[dict[str, Any], Cost]:
     """Run ``dbt build`` against a dev target, gated. Returns (summary, cost).
 
@@ -143,6 +153,15 @@ def build(
     the others) is the backstop. The gate here is defense in depth: the command
     layer has already run the confirm handshake from the same estimate, and this
     re-check binds every caller of the engine regardless.
+
+    ``runtime_key`` chooses the artifact directory for this runtime. A clean
+    shared ``target/`` is reused. A cross-runtime path collision isolates the
+    run, and ``--target-path`` points dbt at that directory.
+    ``artifact_directory`` is that path outright and wins over ``runtime_key``.
+    With neither, the build writes ``<project>/target`` and does not pass
+    ``--target-path``, so a ``target-path`` already set in the project is left
+    alone. The summary names ``artifact_directory`` only when one of those
+    arguments was passed.
     """
 
     assert_dev_target(target, configured_target)
@@ -208,15 +227,28 @@ def build(
     if select:
         argv += ["--select", select]
 
+    named_artifacts = artifact_directory is not None or runtime_key is not None
+    if artifact_directory is not None:
+        artifacts = Path(artifact_directory)
+        if not artifacts.is_absolute():
+            artifacts = project / artifacts
+    elif runtime_key is not None:
+        artifacts = prepare_artifact_dir(project, runtime_key)
+    else:
+        artifacts = project / "target"
+    if named_artifacts:
+        argv += ["--target-path", str(artifacts)]
+
     # A hard compile-time/parse-time failure (a Jinja context error, for
     # instance) dies before dbt ever reaches node execution, so it never
-    # (re)writes target/run_results.json -- a stale one left over from a prior
+    # (re)writes run_results.json -- a stale one left over from a prior
     # successful build would otherwise still be sitting there, and _summarize
     # would report its node results as if they belonged to this invocation
-    # (issue #76). Clearing it first means "file absent" always means "this
-    # invocation wrote nothing", never "an old invocation's results carried
-    # over".
-    (project / "target" / "run_results.json").unlink(missing_ok=True)
+    # (issue #76). Clearing the resolved directory first means "file absent"
+    # always means "this invocation wrote nothing", never "an old invocation's
+    # results carried over". The shared directory is left untouched when this
+    # runtime was isolated away from it.
+    clear_run_results(artifacts)
 
     # cwd is pinned to the project dir so relative paths in profiles.yml (for
     # example a DuckDB `path: ./dev.duckdb`) resolve against the project, never
@@ -234,10 +266,18 @@ def build(
             approved_functions=approved_functions,
         )
         # Compilation also writes run_results; it is not build evidence.
-        (project / "target" / "run_results.json").unlink(missing_ok=True)
+        # Compile itself still uses the project target. This clear is the
+        # resolved directory, so an isolated run does not keep a previous
+        # invocation's results there.
+        clear_run_results(artifacts)
     completed = run(argv)
 
-    summary = _summarize(project, target, completed)
+    summary = _summarize(
+        project,
+        target,
+        completed,
+        artifact_directory=artifacts if named_artifacts else None,
+    )
     if deps_ran:
         summary["deps"] = {"ran": True, "success": True}
     if target_warnings:
@@ -1619,7 +1659,11 @@ def _show_preview(
 
 
 def _summarize(
-    project: Path, target: str, completed: subprocess.CompletedProcess
+    project: Path,
+    target: str,
+    completed: subprocess.CompletedProcess,
+    *,
+    artifact_directory: Path | None = None,
 ) -> dict[str, Any]:
     """Reduce a dbt run to a sanitized summary; raw log text stays behind.
 
@@ -1627,6 +1671,10 @@ def _summarize(
     label the manifest gives it. The id is the only unambiguous identifier (it
     names the resource type and the package, and it is what `run_results.json`
     can be cross-referenced on); the name is what a reader scans.
+
+    ``artifact_directory``, when passed, is the directory this build resolved.
+    The summary then carries that directory's publishable label. Callers that
+    omit it keep reading ``<project>/target`` and the summary shape they had.
     """
 
     nodes: list[dict[str, Any]] = []
@@ -1634,7 +1682,8 @@ def _summarize(
     bytes_billed = 0.0
     saw_billing = False
     elapsed_seconds: float | None = None
-    run_results = project / "target" / "run_results.json"
+    paths = artifact_paths(artifact_directory or (project / "target"))
+    run_results = paths.run_results
     if run_results.is_file():
         document = json.loads(run_results.read_text(encoding="utf-8"))
         results = document.get("results", [])
@@ -1646,9 +1695,7 @@ def _summarize(
         manifest_nodes: dict[str, Any] = {}
         with contextlib.suppress(OSError, json.JSONDecodeError, AttributeError):
             manifest_nodes = (
-                json.loads(
-                    (project / "target" / "manifest.json").read_text(encoding="utf-8")
-                ).get("nodes")
+                json.loads(paths.manifest.read_text(encoding="utf-8")).get("nodes")
                 or {}
             )
         for result in results:
@@ -1695,4 +1742,8 @@ def _summarize(
         summary["bytes_billed"] = bytes_billed
     if elapsed_seconds is not None:
         summary["elapsed_seconds"] = elapsed_seconds
+    if artifact_directory is not None:
+        summary["artifact_directory"] = sanitize_artifact_directory(
+            paths.directory, project_root=project
+        )
     return summary

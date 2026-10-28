@@ -22,6 +22,7 @@ writes to the project and human edits stay authoritative at apply time.
 from __future__ import annotations
 
 from pathlib import PurePosixPath
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -95,7 +96,7 @@ def build(
     findings: list[DriftFinding],
     snap: Snapshot,
     cache: DexCache | None,
-    view: DbtProjectView | None,
+    view: Any | None,
     *,
     pii_overrides: PIIOverrideMatcher | None = None,
     placement: PlacingProject | None = None,
@@ -133,7 +134,11 @@ def build(
     definition_churn = False
     orphan_identifiers: list[str] = []
     for finding in findings:
-        if finding.axis == "schema" and finding.code in _PATCHABLE:
+        if (
+            finding.axis == "schema"
+            and finding.code in _PATCHABLE
+            and finding.identifier is not None
+        ):
             schema_patches.setdefault(finding.identifier, []).append(finding)
         elif finding.code.startswith("definition_") or finding.code.startswith(
             "model_"
@@ -143,7 +148,7 @@ def build(
             # warehouse-side fix to propose.
             definition_churn = True
         else:
-            if finding.code == "orphan_relation":
+            if finding.code == "orphan_relation" and finding.identifier is not None:
                 orphan_identifiers.append(finding.identifier)
             proposals.append(_advisory(finding))
 
@@ -184,7 +189,7 @@ def build(
                     for finding in written
                 )
             continue
-        if view is None or model_path not in view.files:
+        if view is None or model_path is None or model_path not in view.files:
             reason = (
                 "this project format cannot receive edits"
                 if view is None
@@ -299,6 +304,9 @@ def _run_operation_args(identifiers: list[str]) -> str:
 
 def _advisory(finding: DriftFinding) -> Proposal:
     if finding.code == "orphan_relation":
+        operation_args = _run_operation_args(
+            [finding.identifier] if finding.identifier else []
+        )
         return Proposal(
             axis=finding.axis,
             kind="advisory",
@@ -311,8 +319,7 @@ def _advisory(finding: DriftFinding) -> Proposal:
                 "governed macro (dex never executes this itself): scaffold "
                 "it with `transform macro drop_orphan_relations` if the "
                 "project does not have it yet, then run dbt run-operation "
-                "drop_orphan_relations --args "
-                f"'{_run_operation_args([finding.identifier])}'"
+                f"drop_orphan_relations --args '{operation_args}'"
             ),
         )
     actions = {

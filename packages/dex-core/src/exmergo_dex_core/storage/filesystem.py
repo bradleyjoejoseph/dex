@@ -23,10 +23,11 @@ This module is the only place in the engine that knows these file names.
 from __future__ import annotations
 
 import json
+import tempfile
 import threading
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -102,14 +103,14 @@ except ImportError:  # Windows
 
     def _lock_descriptor(handle) -> bool:
         try:
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
         except OSError:
             return False
         return True
 
     def _unlock_descriptor(handle) -> None:
         handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
 
 
 _DOCUMENT_FILES = {
@@ -365,7 +366,18 @@ class FilesystemStore:
     def _write_document(self, document: Document, body: str) -> str:
         self.dex_dir.mkdir(parents=True, exist_ok=True)
         path = self.dex_dir / _DOCUMENT_FILES[document]
-        path.write_text(body + "\n", encoding="utf-8")
+        fd, temp_path = tempfile.mkstemp(
+            dir=self.dex_dir, prefix=f".{path.name}.", suffix=".tmp"
+        )
+        temp_file = Path(temp_path)
+        try:
+            with open(fd, "w", encoding="utf-8") as handle:  # noqa: PTH123
+                handle.write(body + "\n")
+            temp_file.replace(path)
+        except BaseException:
+            with suppress(OSError):
+                temp_file.unlink()
+            raise
         return str(path)
 
     def _append(self, document: Document, entry: dict) -> None:
