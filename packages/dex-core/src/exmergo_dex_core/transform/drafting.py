@@ -438,7 +438,10 @@ class _Lineage:
             )
         else:
             self.reading.produced = list(outputs)
-            self.reading.expressions = dict(outputs)
+            self.reading.expressions = {
+                name: self.resolve_expression(self.tree, expression)
+                for name, expression in outputs.items()
+            }
             for name, expression in outputs.items():
                 origin = self.origin(self.tree, expression)
                 if origin is not None:
@@ -633,6 +636,30 @@ class _Lineage:
         if carried is not None and carried.outer_join is None:
             carried.outer_join = outer
         return carried
+
+    def resolve_expression(self, select: Any, expression: Any, depth: int = 0) -> Any:
+        """Resolve a column expression back through CTEs to its producing expression."""
+        if depth > 32:
+            return expression
+        from sqlglot import expressions as exp
+
+        node = expression.this if isinstance(expression, exp.Alias) else expression
+        while isinstance(node, exp.Paren):
+            node = node.this
+        if not isinstance(node, exp.Column) or isinstance(node.this, exp.Star):
+            return expression
+        found = self.source_of(select, node)
+        if found is None:
+            return expression
+        _alias, relation, _join = found
+        kind, target = self.target(relation)
+        if kind != "scope":
+            return expression
+        outputs = self.outputs(target)
+        inner = None if outputs is None else outputs.get(node.name.lower())
+        if inner is None:
+            return expression
+        return self.resolve_expression(target, inner, depth + 1)
 
     def source_of(self, select: Any, column: Any) -> tuple[str, Any, Any] | None:
         sources = self.sources(select)
@@ -1056,10 +1083,13 @@ def _drafted(
         drafted["grain"] = {"value": None, "withheld": reading.grain_withheld}
 
     columns: dict[str, Any] = {}
-    for name, origin in reading.origins.items():
+    candidates = (
+        reading.produced if reading.produced is not None else list(reading.origins)
+    )
+    for name in candidates:
         facts = _column_facts(
             name,
-            origin,
+            reading.origins.get(name),
             reading,
             cache,
             files,
@@ -1112,7 +1142,7 @@ def _drafted(
 
 def _column_facts(
     name: str,
-    origin: _Origin,
+    origin: _Origin | None,
     reading: _Reading,
     cache: DexCache | None,
     files: Mapping[str, str],
@@ -1121,17 +1151,23 @@ def _column_facts(
     cumulative: Mapping[str, set[str]],
     model: str | None = None,
 ) -> dict[str, Any]:
-    dataset = dataset_for(cache, origin.relation)
-    profile = _column(dataset, origin.column)
-    source = f"{origin.relation}.{origin.column}"
-    facts: dict[str, Any] = {"from": source}
+    facts: dict[str, Any] = {}
+    if origin is not None:
+        dataset = dataset_for(cache, origin.relation)
+        profile = _column(dataset, origin.column)
+        source: str | None = f"{origin.relation}.{origin.column}"
+        facts["from"] = source
+    else:
+        dataset = None
+        profile = None
+        source = None
 
     if reading.grain == [name]:
         facts["role"] = {
             "value": "key",
             "evidence": f"the model's drafted grain: {reading.grain_evidence}",
         }
-    elif dataset is not None and cache is not None:
+    elif origin is not None and dataset is not None and cache is not None:
         reference = _verified_reference(
             cache, dataset, origin.column, files, model_paths, model=model
         )
@@ -1152,59 +1188,143 @@ def _column_facts(
         elif reference is not None:
             facts["references"] = {"value": None, "withheld": reference[1]}
 
-    if profile is None:
-        return facts
+    if origin is not None and profile is not None and source is not None:
+        if profile.pii is not None:
+            facts["pii"] = {
+                "value": {
+                    "category": profile.pii.category.value,
+                    "confidence": profile.pii.confidence,
+                },
+                "evidence": f"flagged on {source} by the profile",
+            }
 
-    if profile.pii is not None:
-        facts["pii"] = {
-            "value": {
-                "category": profile.pii.category.value,
-                "confidence": profile.pii.confidence,
-            },
-            "evidence": f"flagged on {source} by the profile",
-        }
+        if origin.outer_join is not None:
+            facts["nullable"] = {
+                "value": True,
+                "evidence": (
+                    f"it comes from the outer side of the {origin.outer_join}; a row "
+                    "with no match carries NULL here"
+                ),
+            }
+        elif profile.null_fraction == 0.0:
+            facts["nullable"] = {
+                "value": False,
+                "evidence": (
+                    f"{source} held no NULL when profiled, and no outer join sits "
+                    "between it and this column"
+                ),
+            }
+        elif profile.null_fraction is not None:
+            facts["nullable"] = {
+                "value": True,
+                "evidence": (
+                    f"{source} was {profile.null_fraction:.1%} NULL when profiled"
+                ),
+            }
 
-    if origin.outer_join is not None:
-        facts["nullable"] = {
-            "value": True,
-            "evidence": (
-                f"it comes from the outer side of the {origin.outer_join}; a row "
-                "with no match carries NULL here"
-            ),
-        }
-    elif profile.null_fraction == 0.0:
-        facts["nullable"] = {
-            "value": False,
-            "evidence": (
-                f"{source} held no NULL when profiled, and no outer join sits "
-                "between it and this column"
-            ),
-        }
-    elif profile.null_fraction is not None:
-        facts["nullable"] = {
-            "value": True,
-            "evidence": f"{source} was {profile.null_fraction:.1%} NULL when profiled",
-        }
+        if dataset is not None and origin.column.lower() in {
+            c.lower() for c in cumulative.get(dataset.identifier, set())
+        }:
+            facts["additivity"] = {
+                "value": "semi_additive",
+                "evidence": (
+                    f"the cumulative check found {source} never decreasing within an "
+                    "entity over time; summing it across rows multiplies the true value"
+                ),
+            }
 
-    if dataset is not None and origin.column.lower() in {
-        c.lower() for c in cumulative.get(dataset.identifier, set())
-    }:
-        facts["additivity"] = {
-            "value": "semi_additive",
-            "evidence": (
-                f"the cumulative check found {source} never decreasing within an "
-                "entity over time; summing it across rows multiplies the true value"
-            ),
-        }
+        unit = _unit_shape(name, profile)
+        if unit is not None:
+            facts["unit"] = {
+                "value": unit[0],
+                "evidence": (
+                    f"{unit[1]} in {source}; a hypothesis about the unit, not a "
+                    "certified one"
+                ),
+            }
 
-    unit = _unit_shape(name, profile)
-    if unit is not None:
-        facts["unit"] = {
-            "value": unit[0],
-            "evidence": f"{unit[1]} in {source}; a hypothesis about the unit, not a "
-            "certified one",
-        }
+    if "additivity" not in facts:
+        computed = _computed_additivity(reading.expressions.get(name))
+        if computed is not None:
+            facts["additivity"] = computed
+
     return facts
+
+
+def _is_running_frame(spec: Any) -> bool:
+    """Whether a window frame forms a running total."""
+    if spec is None:
+        return True
+    kind = str(spec.args.get("kind") or "").lower()
+    if kind not in ("rows", "range"):
+        return False
+    start = str(spec.args.get("start") or "").upper()
+    start_side = str(spec.args.get("start_side") or "").lower()
+    if start != "UNBOUNDED" or start_side != "preceding":
+        return False
+    if spec.args.get("exclude") is not None:
+        return False
+    end = spec.args.get("end")
+    end_str = str(end).upper() if end is not None else None
+    end_side = spec.args.get("end_side")
+    end_side_str = str(end_side).upper() if end_side is not None else None
+    if end_str not in (None, "CURRENT ROW"):
+        return False
+    return end_side_str in (None, "CURRENT ROW")
+
+
+def _computed_additivity(expression: Any) -> dict[str, str] | None:
+    """Semi-additive fact when ``expression`` is a running sum/count window."""
+    if expression is None:
+        return None
+    from sqlglot import expressions as exp
+
+    node = expression.this if isinstance(expression, exp.Alias) else expression
+    while isinstance(node, exp.Paren):
+        node = node.this
+    if not isinstance(node, exp.Window):
+        return None
+
+    func = node.this
+    while isinstance(func, exp.Paren):
+        func = func.this
+    if isinstance(func, exp.Sum) or (
+        isinstance(func, exp.Anonymous) and func.name.lower() == "sum"
+    ):
+        agg_name = "sum"
+    elif isinstance(func, exp.Count) or (
+        isinstance(func, exp.Anonymous) and func.name.lower() == "count"
+    ):
+        agg_name = "count"
+    else:
+        return None
+
+    order = node.args.get("order")
+    if order is None or not order.expressions:
+        return None
+
+    spec = node.args.get("spec")
+    if not _is_running_frame(spec):
+        return None
+
+    partitions = [
+        p.name if isinstance(p, exp.Column) else p.sql().lower()
+        for p in (node.args.get("partition_by") or [])
+    ]
+    orders = [
+        (o.this.name if isinstance(o.this, exp.Column) else o.this.sql().lower())
+        if isinstance(o, exp.Ordered)
+        else (o.name if isinstance(o, exp.Column) else o.sql().lower())
+        for o in order.expressions
+    ]
+    part_str = ", ".join(partitions)
+    ord_str = ", ".join(orders)
+    if partitions:
+        window_desc = f"over {part_str} ordered by {ord_str}"
+    else:
+        window_desc = f"ordered by {ord_str}"
+    evidence = f"a running {agg_name} {window_desc}"
+    return {"value": "semi_additive", "evidence": evidence}
 
 
 def _verified_reference(

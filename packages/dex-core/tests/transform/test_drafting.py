@@ -255,6 +255,168 @@ def test_a_flagged_running_total_is_drafted_semi_additive():
     assert "cumulative check" in additivity["evidence"]
 
 
+def test_a_computed_running_total_window_is_drafted_semi_additive():
+    entry, _ = _draft(
+        "select order_id,\n"
+        "    sum(amount) over (\n"
+        "        partition by customer_id order by placed_at\n"
+        "    ) as running_amount\n"
+        "from {{ ref('stg_orders') }}\n"
+    )
+
+    column = entry["drafted"]["columns"]["running_amount"]
+    assert column["additivity"]["value"] == "semi_additive"
+    assert (
+        column["additivity"]["evidence"]
+        == "a running sum over customer_id ordered by placed_at"
+    )
+    assert "from" not in column
+
+
+def test_running_total_window_frame_variations():
+    # Explicit ROWS frame
+    entry, _ = _draft(
+        "select order_id, sum(amount) over (\n"
+        "    partition by customer_id order by placed_at\n"
+        "    rows between unbounded preceding and current row\n"
+        ") as running_amount\n"
+        "from {{ ref('stg_orders') }}\n"
+    )
+    assert (
+        entry["drafted"]["columns"]["running_amount"]["additivity"]["evidence"]
+        == "a running sum over customer_id ordered by placed_at"
+    )
+
+    # Explicit RANGE frame
+    entry, _ = _draft(
+        "select order_id, sum(amount) over (\n"
+        "    partition by customer_id order by placed_at\n"
+        "    range between unbounded preceding and current row\n"
+        ") as running_amount\n"
+        "from {{ ref('stg_orders') }}\n"
+    )
+    assert (
+        entry["drafted"]["columns"]["running_amount"]["additivity"]["evidence"]
+        == "a running sum over customer_id ordered by placed_at"
+    )
+
+    # No partition by (running sum ordered by placed_at)
+    entry, _ = _draft(
+        "select order_id, sum(amount) over (order by placed_at) as running_amount\n"
+        "from {{ ref('stg_orders') }}\n"
+    )
+    assert (
+        entry["drafted"]["columns"]["running_amount"]["additivity"]["evidence"]
+        == "a running sum ordered by placed_at"
+    )
+
+    # Running count with partition by
+    entry, _ = _draft(
+        "select order_id,\n"
+        "    count(*) over (\n"
+        "        partition by customer_id order by placed_at\n"
+        "    ) as running_count\n"
+        "from {{ ref('stg_orders') }}\n"
+    )
+    assert (
+        entry["drafted"]["columns"]["running_count"]["additivity"]["evidence"]
+        == "a running count over customer_id ordered by placed_at"
+    )
+
+    # Running count without partition by
+    entry, _ = _draft(
+        "select order_id, count(order_id) over (order by placed_at) as running_count\n"
+        "from {{ ref('stg_orders') }}\n"
+    )
+    assert (
+        entry["drafted"]["columns"]["running_count"]["additivity"]["evidence"]
+        == "a running count ordered by placed_at"
+    )
+
+    # Multiple partition and order columns
+    entry, _ = _draft(
+        "select order_id, sum(amount) over (\n"
+        "    partition by customer_id, is_gift order by placed_at, order_id\n"
+        ") as running_amount\n"
+        "from {{ ref('stg_orders') }}\n"
+    )
+    assert (
+        entry["drafted"]["columns"]["running_amount"]["additivity"]["evidence"]
+        == "a running sum over customer_id, is_gift ordered by placed_at, order_id"
+    )
+
+    # Computed in a CTE
+    entry, _ = _draft(
+        "with running as (\n"
+        "    select customer_id,\n"
+        "        sum(amount) over (\n"
+        "            partition by customer_id order by placed_at\n"
+        "        ) as running_amount\n"
+        "    from {{ ref('stg_orders') }}\n"
+        ")\n"
+        "select customer_id, running_amount from running\n"
+    )
+    assert (
+        entry["drafted"]["columns"]["running_amount"]["additivity"]["evidence"]
+        == "a running sum over customer_id ordered by placed_at"
+    )
+
+
+def test_window_not_drafted_as_running_total():
+    # Window with no order by (partition total)
+    entry, _ = _draft(
+        "select order_id,\n"
+        "    sum(amount) over (partition by customer_id) as partition_total\n"
+        "from {{ ref('stg_orders') }}\n"
+    )
+    assert "partition_total" not in entry["drafted"].get("columns", {})
+
+    # Bounded rolling window (6 preceding)
+    entry, _ = _draft(
+        "select order_id, sum(amount) over (\n"
+        "    partition by customer_id order by placed_at\n"
+        "    rows between 6 preceding and current row\n"
+        ") as rolling_amount\n"
+        "from {{ ref('stg_orders') }}\n"
+    )
+    assert "rolling_amount" not in entry["drafted"].get("columns", {})
+
+    # Bounded rolling window (1 preceding)
+    entry, _ = _draft(
+        "select order_id, sum(amount) over (\n"
+        "    partition by customer_id order by placed_at\n"
+        "    rows between 1 preceding and current row\n"
+        ") as rolling_amount\n"
+        "from {{ ref('stg_orders') }}\n"
+    )
+    assert "rolling_amount" not in entry["drafted"].get("columns", {})
+
+    # Frame with unbounded following
+    entry, _ = _draft(
+        "select order_id, sum(amount) over (\n"
+        "    partition by customer_id order by placed_at\n"
+        "    rows between unbounded preceding and unbounded following\n"
+        ") as full_amount\n"
+        "from {{ ref('stg_orders') }}\n"
+    )
+    assert "full_amount" not in entry["drafted"].get("columns", {})
+
+    # Other aggregates: avg, max, min, row_number
+    entry, _ = _draft(
+        "select order_id,\n"
+        "    avg(amount) over (partition by customer_id order by placed_at) as a,\n"
+        "    max(amount) over (partition by customer_id order by placed_at) as m,\n"
+        "    min(amount) over (partition by customer_id order by placed_at) as mi,\n"
+        "    row_number() over (partition by customer_id order by placed_at) as rn\n"
+        "from {{ ref('stg_orders') }}\n"
+    )
+    columns = entry["drafted"].get("columns", {})
+    assert "a" not in columns
+    assert "m" not in columns
+    assert "mi" not in columns
+    assert "rn" not in columns
+
+
 def test_unit_shapes_are_drafted_as_hypotheses_and_never_from_a_flag_column():
     entry, _ = _draft(
         "select order_id, discount_rate, margin_pct, is_gift, amount\n"
