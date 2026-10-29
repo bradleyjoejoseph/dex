@@ -1130,12 +1130,15 @@ def verify(
                     ", ".join(live_namespaces) if live_namespaces else "dev"
                 )
             else:
+                adapter_target = getattr(adapter, "target", None)
+                target_schemas = getattr(adapter_target, "schemas", None)
                 judged_namespace = (
                     ", ".join(live_namespaces)
                     if live_namespaces
                     else (
-                        getattr(getattr(adapter, "target", None), "schemas", None)
-                        and ", ".join(adapter.target.schemas)
+                        ", ".join(target_schemas)
+                        if target_schemas is not None
+                        else None
                     )
                 ) or None
 
