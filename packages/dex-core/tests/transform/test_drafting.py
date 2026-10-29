@@ -1196,3 +1196,171 @@ def test_plan_does_not_name_union_cte_as_unprofiled_relation(shop, capsys):
     # Drafting should not report 'combined' as an unprofiled relation.
     assert not any("combined" in w for w in envelope.get("warnings", []))
     assert "fct_daily" in envelope["data"]["declarations"]
+
+
+def test_a_literal_alias_is_recognized_as_a_project_model():
+    """A warehouse relation named by config(alias=…) maps back to the model."""
+    from exmergo_dex_core.cache import (
+        ColumnProfile,
+        Dataset,
+        DexCache,
+        Relationship,
+        RelationshipKind,
+    )
+    from exmergo_dex_core.transform.drafting import draft
+
+    def key(n: str) -> ColumnProfile:
+        return ColumnProfile(
+            name=n,
+            data_type="integer",
+            null_fraction=0.0,
+            is_unique=True,
+            distinct_count_exact=True,
+        )
+
+    def col(n: str) -> ColumnProfile:
+        return ColumnProfile(name=n, data_type="integer", null_fraction=0.0)
+
+    files = {
+        "models/marts/fct.sql": (
+            "select order_id, customer_id from {{ ref('stg_orders') }}\n"
+        ),
+        "models/staging/stg_orders.sql": (
+            "select order_id, customer_id from {{ source('raw','orders') }}\n"
+        ),
+        "models/staging/stg_customers.sql": (
+            "{{ config(alias='customers_clean') }}\n"
+            "select customer_id from {{ source('raw','customers') }}\n"
+        ),
+    }
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier="w.dev.stg_orders",
+                columns=[key("order_id"), col("customer_id")],
+            ),
+            Dataset(
+                identifier="w.dev.customers_clean",
+                columns=[key("customer_id")],
+            ),
+        ],
+        relationships=[
+            Relationship(
+                from_dataset="w.dev.stg_orders",
+                from_columns=["customer_id"],
+                to_dataset="w.dev.customers_clean",
+                to_columns=["customer_id"],
+                kind=RelationshipKind.INFERRED,
+                verified=True,
+                orphan_fraction=0.0,
+            )
+        ],
+    )
+    drafts, _ = draft(["fct"], files, ["models"], cache, dialect="duckdb")
+    refs = drafts["fct"]["drafted"]["columns"]["customer_id"]["references"]
+    assert refs["value"] == "stg_customers.customer_id"
+    assert "not a model of this project" not in refs["evidence"]
+
+
+def test_an_aliased_input_is_found_in_the_cache_under_its_alias():
+    """dataset lookup by model name resolves the relation the alias built."""
+    from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache
+    from exmergo_dex_core.transform.drafting import draft
+
+    def key(n: str) -> ColumnProfile:
+        return ColumnProfile(
+            name=n,
+            data_type="integer",
+            null_fraction=0.0,
+            is_unique=True,
+            distinct_count_exact=True,
+        )
+
+    files = {
+        "models/marts/fct.sql": (
+            "select customer_id from {{ ref('stg_customers') }}\n"
+        ),
+        "models/staging/stg_customers.sql": (
+            "{{ config(alias='customers_clean') }}\n"
+            "select customer_id from {{ source('raw','customers') }}\n"
+        ),
+    }
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier="w.dev.customers_clean",
+                columns=[key("customer_id")],
+            )
+        ],
+    )
+    drafts, warnings = draft(["fct"], files, ["models"], cache, dialect="duckdb")
+    inputs = {i["relation"]: i for i in drafts["fct"]["drafted"]["inputs"]}
+    assert inputs["stg_customers"]["profiled"] is True
+    assert not any("stg_customers" in w and "not profiled" in w for w in warnings)
+
+
+def test_a_yaml_literal_alias_is_recognized_the_same_way():
+    from exmergo_dex_core.cache import (
+        ColumnProfile,
+        Dataset,
+        DexCache,
+        Relationship,
+        RelationshipKind,
+    )
+    from exmergo_dex_core.transform.drafting import draft
+
+    def key(n: str) -> ColumnProfile:
+        return ColumnProfile(
+            name=n,
+            data_type="integer",
+            null_fraction=0.0,
+            is_unique=True,
+            distinct_count_exact=True,
+        )
+
+    def col(n: str) -> ColumnProfile:
+        return ColumnProfile(name=n, data_type="integer", null_fraction=0.0)
+
+    files = {
+        "models/marts/fct.sql": (
+            "select order_id, customer_id from {{ ref('stg_orders') }}\n"
+        ),
+        "models/staging/stg_orders.sql": (
+            "select order_id, customer_id from {{ source('raw','orders') }}\n"
+        ),
+        "models/staging/stg_customers.sql": (
+            "select customer_id from {{ source('raw','customers') }}\n"
+        ),
+        "models/staging/schema.yml": (
+            "models:\n"
+            "  - name: stg_customers\n"
+            "    config:\n"
+            "      alias: customers_clean\n"
+        ),
+    }
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier="w.dev.stg_orders",
+                columns=[key("order_id"), col("customer_id")],
+            ),
+            Dataset(
+                identifier="w.dev.customers_clean",
+                columns=[key("customer_id")],
+            ),
+        ],
+        relationships=[
+            Relationship(
+                from_dataset="w.dev.stg_orders",
+                from_columns=["customer_id"],
+                to_dataset="w.dev.customers_clean",
+                to_columns=["customer_id"],
+                kind=RelationshipKind.INFERRED,
+                verified=True,
+                orphan_fraction=0.0,
+            )
+        ],
+    )
+    drafts, _ = draft(["fct"], files, ["models"], cache, dialect="duckdb")
+    refs = drafts["fct"]["drafted"]["columns"]["customer_id"]["references"]
+    assert refs["value"] == "stg_customers.customer_id"

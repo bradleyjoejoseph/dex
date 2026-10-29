@@ -2195,6 +2195,20 @@ def semantic_free_drift(
         if base_defs[key].content_sha256 != cur_defs[key].content_sha256:
             kind, name = key
             path = cur_defs[key].path
+            # annotate_impacts only fills warehouse findings with a physical
+            # identifier; semantic definition_changed has none, so set the
+            # impact here (#889). A changed metric always includes itself and
+            # transitive dependents via input_metrics. A changed semantic model
+            # impacts every metric that draws on its measures.
+            if kind == "metric":
+                impacted_metrics = _metrics_from_metric(current, name)
+            elif kind == "semantic_model":
+                sm = next((m for m in current.semantic_models if m.name == name), None)
+                impacted_metrics = (
+                    _metrics_from_measures(current, set(sm.measures)) if sm else []
+                )
+            else:
+                impacted_metrics = []
             findings.append(
                 DriftFinding(
                     axis="semantic",
@@ -2208,6 +2222,7 @@ def semantic_free_drift(
                     # file; `kind` and `name` already identify it.
                     data={"kind": kind, "name": name}
                     | ({"path": path} if path else {}),
+                    impacted_metrics=impacted_metrics,
                 )
             )
 
@@ -2857,6 +2872,22 @@ def _models_by_table(transform: TransformLayer) -> dict[str, set[str]]:
     for model in transform.models:
         by_table.setdefault(model.lower(), set()).add(model)
     return {table: closure(models) for table, models in by_table.items()}
+
+
+def _metrics_from_metric(semantic, seed: str) -> list[str]:
+    """The changed metric plus metrics that transitively depend on it via
+    ``input_metrics`` (ratio / derived). Always includes ``seed`` even when
+    the layer no longer lists that metric by name as a separate object."""
+
+    impacted = {seed}
+    grew = True
+    while grew:
+        grew = False
+        for metric in semantic.metrics:
+            if metric.name not in impacted and set(metric.input_metrics) & impacted:
+                impacted.add(metric.name)
+                grew = True
+    return sorted(impacted)
 
 
 def _metrics_from_measures(semantic, measures: set[str]) -> list[str]:

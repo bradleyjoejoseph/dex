@@ -893,6 +893,9 @@ def test_relationships_verify_beyond_budget_checkpoints(
     assert envelope.status.value == "needs_confirmation"
     assert envelope.data["phase"] == "verify"
     assert envelope.data["command"] == "explore relationships"
+    assert "beyond what remains of the confirmed budget" in envelope.data["hint"]
+    assert "a re-run re-profiles first" in envelope.data["hint"]
+    assert "and needs confirming" not in envelope.data["hint"]
     assert not _probe_executed(fk_bq_client)
     assert not any(
         "verified" in note and "overlap" in note for note in envelope.data["notes"]
@@ -927,6 +930,9 @@ def test_unconfirmed_verify_over_a_fresh_cache_checkpoints_at_the_phase(
     assert envelope.data["phase"] == "verify"
     assert envelope.data["per_table_bytes"] == {"(join overlap probes)": 20 * MB}
     assert "--budget" in envelope.data["hint"]
+    assert "and needs confirming" in envelope.data["hint"]
+    assert "beyond what remains of the confirmed budget" not in envelope.data["hint"]
+    assert "a re-run re-profiles first" not in envelope.data["hint"]
     assert envelope.cost.estimate == 20 * MB
     assert not _probe_executed(fk_bq_client)
 
@@ -1055,6 +1061,41 @@ def test_cumulative_handshake_uses_the_adapters_estimate_description():
     assert pending.data["object_count"] == 2
     assert "notes" in pending.data
     assert pending.cost.estimate == 13.0
+    assert "beyond what remains of the confirmed budget" in pending.data["hint"]
+    assert "a re-run re-profiles first" in pending.data["hint"]
+    assert "and needs confirming" not in pending.data["hint"]
+
+
+def test_unconfirmed_cumulative_handshake_says_needs_confirming():
+    gate = CostGate(
+        paradigm=Paradigm.COMPUTE_TIME,
+        ceiling=10.0,
+        session_ceiling=None,
+        session_spent=0.0,
+        confirmed=False,
+        connector="snowflake",
+        command="explore profile",
+    )
+
+    class StubAdapter:
+        cost_gate = gate
+
+        def describe_estimate(self, estimate, per_table):
+            return {
+                "estimated_seconds": estimate,
+                "per_table_seconds": per_table,
+            }
+
+    from exmergo_dex_core import command_args
+
+    pending = command_args.cumulative_handshake(
+        "explore profile", StubAdapter(), 5.0, candidate_count=2, object_count=2
+    )
+    assert pending is not None
+    assert pending.data["phase"] == "check-cumulative"
+    assert "and needs confirming" in pending.data["hint"]
+    assert "beyond what remains of the confirmed budget" not in pending.data["hint"]
+    assert "a re-run re-profiles first" not in pending.data["hint"]
 
 
 def test_cumulative_handshake_stays_none_on_a_free_connector_or_no_candidates():
@@ -1091,6 +1132,60 @@ def test_cumulative_handshake_stays_none_on_a_free_connector_or_no_candidates():
         )
         is None
     )
+
+
+def test_confirmed_sample_handshake_retains_beyond_what_remains():
+    gate = CostGate(
+        paradigm=Paradigm.COMPUTE_TIME,
+        ceiling=10.0,
+        session_ceiling=None,
+        session_spent=0.0,
+        confirmed=True,
+        connector="snowflake",
+        command="explore cluster",
+    )
+    gate.charge(8.0)
+
+    class StubAdapter:
+        cost_gate = gate
+
+        def describe_estimate(self, estimate, per_table):
+            return {"estimated_seconds": estimate}
+
+    from exmergo_dex_core import command_args
+
+    pending = command_args.sample_handshake("explore cluster", StubAdapter(), 5.0)
+    assert pending is not None
+    assert pending.data["phase"] == "sample"
+    assert "beyond what remains of the confirmed budget" in pending.data["hint"]
+    assert "and needs confirming" not in pending.data["hint"]
+
+
+def test_unconfirmed_sample_handshake_says_needs_confirming():
+    gate = CostGate(
+        paradigm=Paradigm.COMPUTE_TIME,
+        ceiling=10.0,
+        session_ceiling=None,
+        session_spent=0.0,
+        confirmed=False,
+        connector="snowflake",
+        command="explore cluster",
+    )
+
+    class StubAdapter:
+        cost_gate = gate
+
+        def describe_estimate(self, estimate, per_table):
+            return {"estimated_seconds": estimate}
+
+    from exmergo_dex_core import command_args
+
+    pending = command_args.sample_handshake("explore cluster", StubAdapter(), 5.0)
+    assert pending is not None
+    assert pending.data["phase"] == "sample"
+    assert "and needs confirming" in pending.data["hint"]
+    assert "beyond what remains of the confirmed budget" not in pending.data["hint"]
+    assert "a re-run re-profiles first" not in pending.data["hint"]
 
 
 def test_duckdb_map_verify_stays_confirmation_free(duckdb_file: Path, capsys):
@@ -1205,12 +1300,45 @@ def test_overlap_beyond_budget_checkpoints_before_any_probe(
     assert envelope.data["cap"] == 50
     assert envelope.data["elided"] == 0
     assert "--budget" in envelope.data["hint"]
+    assert "beyond what remains of the confirmed budget" in envelope.data["hint"]
+    assert "a re-run re-profiles first" in envelope.data["hint"]
+    assert "and needs confirming" not in envelope.data["hint"]
     assert not _probe_executed(overlap_bq_client)
     # The map itself completed and persisted, unswept: no relationship yet,
     # since nothing was found before the sweep's own checkpoint.
     assert envelope.data["relationship_count"] == 0
     assert Path(envelope.data["cache_path"]).exists()
     assert any("unswept" in note for note in envelope.data["notes"])
+
+
+def test_unconfirmed_overlap_over_a_fresh_cache_checkpoints_at_the_phase(
+    overlap_bq_client, route_adapter, tmp_path
+):
+    route_adapter(overlap_bq_client)
+    first = _dispatch(
+        tmp_path,
+        subcommand="map",
+        confirm=True,
+        budget=float(100 * MB),
+    )
+    assert first.status.value == "ok"
+    overlap_bq_client.query_calls.clear()
+
+    envelope = _dispatch(
+        tmp_path,
+        subcommand="map",
+        infer_by_overlap=True,
+    )
+    assert envelope.status.value == "needs_confirmation"
+    assert envelope.data["phase"] == "overlap"
+    assert envelope.data["candidate_count"] == 1
+    assert envelope.data["object_count"] == 2
+    assert envelope.data["per_table_bytes"] == {"(overlap sweep probes)": 20 * MB}
+    assert "--budget" in envelope.data["hint"]
+    assert "and needs confirming" in envelope.data["hint"]
+    assert "beyond what remains of the confirmed budget" not in envelope.data["hint"]
+    assert "a re-run re-profiles first" not in envelope.data["hint"]
+    assert not _probe_executed(overlap_bq_client)
 
 
 def test_relationships_overlap_beyond_budget_checkpoints(
@@ -1336,6 +1464,47 @@ def test_overlap_handshake_uses_the_adapters_estimate_description():
     assert pending.data["elided"] == 0
     assert "notes" in pending.data
     assert pending.cost.estimate == 13.0
+    assert "beyond what remains of the confirmed budget" in pending.data["hint"]
+    assert "a re-run re-profiles first" in pending.data["hint"]
+    assert "and needs confirming" not in pending.data["hint"]
+
+
+def test_unconfirmed_overlap_handshake_says_needs_confirming():
+    gate = CostGate(
+        paradigm=Paradigm.COMPUTE_TIME,
+        ceiling=10.0,
+        session_ceiling=None,
+        session_spent=0.0,
+        confirmed=False,
+        connector="snowflake",
+        command="explore map",
+    )
+
+    class StubAdapter:
+        cost_gate = gate
+
+        def describe_estimate(self, estimate, per_table):
+            return {
+                "estimated_seconds": estimate,
+                "per_table_seconds": per_table,
+            }
+
+    from exmergo_dex_core import command_args
+
+    pending = command_args.overlap_handshake(
+        "explore map",
+        StubAdapter(),
+        5.0,
+        candidate_count=3,
+        object_count=2,
+        cap=50,
+        elided=0,
+    )
+    assert pending is not None
+    assert pending.data["phase"] == "overlap"
+    assert "and needs confirming" in pending.data["hint"]
+    assert "beyond what remains of the confirmed budget" not in pending.data["hint"]
+    assert "a re-run re-profiles first" not in pending.data["hint"]
 
 
 def test_duckdb_map_overlap_stays_confirmation_free(duckdb_file: Path, capsys):

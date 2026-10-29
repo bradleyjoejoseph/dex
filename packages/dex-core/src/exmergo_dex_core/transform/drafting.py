@@ -1030,6 +1030,86 @@ def _literal(node: Any) -> str | Decimal | None:
 # --- cache reads --------------------------------------------------------------------
 
 
+_SQL_CONFIG_ALIAS = re.compile(
+    r"""\{\{[\s\S]*?\bconfig\s*\([\s\S]*?\balias\s*=\s*(['\"])([^'\"]+)\1""",
+    re.IGNORECASE,
+)
+
+
+def _literal_model_aliases(
+    files: Mapping[str, str], model_paths: list[str]
+) -> dict[str, str]:
+    """Map a lowercased relation alias to the model stem that declares it.
+
+    Only literal aliases are resolved: ``config(alias='…')`` in SQL, and
+    ``config: alias:`` on a model's YAML entry. A Jinja expression, a
+    ``generate_alias_name`` macro, or a non-literal ``+alias`` cannot be
+    known from the repository alone and is left out so the draft never
+    invents a parent.
+    """
+
+    roots = [PurePosixPath(p) for p in model_paths]
+    out: dict[str, str] = {}
+    for path, content in files.items():
+        candidate = PurePosixPath(path)
+        if candidate.suffix == ".sql" and any(r in candidate.parents for r in roots):
+            match = _SQL_CONFIG_ALIAS.search(content)
+            if match:
+                out[match.group(2).lower()] = candidate.stem
+            continue
+        if not path.endswith((".yml", ".yaml")) or path.endswith("dbt_project.yml"):
+            continue
+        try:
+            data = yaml.safe_load(content) or {}
+        except yaml.YAMLError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        for entry in data.get("models") or []:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            config = entry.get("config") or {}
+            alias = config.get("alias") if isinstance(config, dict) else None
+            if (
+                isinstance(name, str)
+                and isinstance(alias, str)
+                and alias
+                and "{{" not in alias
+            ):
+                out[alias.lower()] = name
+    return out
+
+
+def _alias_of_model(
+    files: Mapping[str, str], model_paths: list[str], model: str
+) -> str | None:
+    """The literal alias a model declares, or ``None`` when it has none."""
+
+    wanted = model.lower()
+    for alias, stem in _literal_model_aliases(files, model_paths).items():
+        if stem.lower() == wanted:
+            return alias
+    return None
+
+
+def _dataset_for_model(
+    cache: DexCache | None,
+    name: str,
+    files: Mapping[str, str],
+    model_paths: list[str],
+) -> Dataset | None:
+    """Cache dataset for a model name, falling back to its literal alias."""
+
+    found = dataset_for(cache, name)
+    if found is not None:
+        return found
+    alias = _alias_of_model(files, model_paths, name)
+    if alias is None:
+        return None
+    return dataset_for(cache, alias)
+
+
 def dataset_for(cache: DexCache | None, name: str) -> Dataset | None:
     """The cache's one dataset ``name`` resolves to, or None (absent or ambiguous)."""
 
@@ -1112,7 +1192,7 @@ def _drafted(
 
     inputs = []
     for relation in reading.relations:
-        dataset = dataset_for(cache, relation)
+        dataset = _dataset_for_model(cache, relation, files, model_paths)
         entry: dict[str, Any] = {"relation": relation}
         if dataset is not None and dataset.columns:
             entry["profiled"] = True
@@ -1153,7 +1233,7 @@ def _column_facts(
 ) -> dict[str, Any]:
     facts: dict[str, Any] = {}
     if origin is not None:
-        dataset = dataset_for(cache, origin.relation)
+        dataset = _dataset_for_model(cache, origin.relation, files, model_paths)
         profile = _column(dataset, origin.column)
         source: str | None = f"{origin.relation}.{origin.column}"
         facts["from"] = source
@@ -1175,7 +1255,7 @@ def _column_facts(
             # A staging model's column comes from a raw table, whose joins on a
             # warehouse reach only other raw tables (#892). Once the model is
             # built, its own relation's joins reach the models beside it.
-            built = dataset_for(cache, model)
+            built = _dataset_for_model(cache, model, files, model_paths)
             if built is not None and built is not dataset:
                 own = _verified_reference(
                     cache, built, name, files, model_paths, model=model
@@ -1481,6 +1561,9 @@ def _project_name(
             continue
         if candidate.suffix == ".csv" or any(r in candidate.parents for r in roots):
             return candidate.stem
+    aliases = _literal_model_aliases(files, model_paths)
+    if name.lower() in aliases:
+        return aliases[name.lower()]
     return name
 
 
